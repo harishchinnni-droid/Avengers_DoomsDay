@@ -1,0 +1,9 @@
+# Contains plaintext credentials -- the SmartApi library logs the full
+# request body (including password) into these files on a failed Angel One
+# login. Never commit.
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
