@@ -397,7 +397,20 @@ def run_live_day(trade_date: date, kite, angel) -> None:
         excel_format.format_workbook(workbook)
         print(f"[live] {slot} cycle done -> {workbook.name}")
 
-    live_loop.run_live_session(on_candle, trade_date)
+    # Fast SL/Target/TSL tracker -- see run_TW_ALL.run_live_day's identical
+    # block for the full reasoning. Only ever touches real open live
+    # positions from THIS pipeline's own state, never the whole watchlist.
+    square_off = ist_clock.combine_ist(
+        trade_date, ist_clock.MARKET_OPEN.replace(hour=15, minute=15))
+
+    def on_fast_tick(now) -> None:
+        if angel is None:
+            return
+        order_engine.fast_track_live_positions(state, angel, square_off)
+
+    live_loop.run_live_session(
+        on_candle, trade_date, on_tick=on_fast_tick,
+        tick_every=config.LIVE_FAST_TRACK_INTERVAL_SECS)
     print(f"\n[live] session complete -> {workbook.name}")
 
 

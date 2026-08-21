@@ -34,11 +34,13 @@ import pandas as pd
 
 import config
 import ist_clock
+import live_orders
 import oi_log
 import option_audit
 import option_chain
 import option_data
 import order_sheet
+import paths
 import quote_history
 from order_sheet import Position, SignalRun, make_rejection
 
@@ -122,6 +124,46 @@ def _third_candle_rising(symbol: str, candles: dict, rejected_at: datetime,
     return False, decided_at
 
 
+def _candle_momentum_checkpoint_signal(symbol: str, candles: dict,
+                                       rejected_at: datetime
+                                       ) -> tuple[str | None, datetime | None]:
+    """
+    CANDLE-MOMENTUM CHECKPOINT (20-Aug-26, Harish -- see
+    config.CANDLE_MOMENTUM_CHECKPOINT_ENABLED for the ASIANPAINT-shaped
+    example this comes from). `rejected_at` is the same entry_at
+    signal_quality.candle_momentum_ok was evaluated at when it rejected a
+    run for "no candle follow-through" -- the confirming trigger candle's
+    close didn't clear the leading one's, in the signal's direction.
+
+    Same shape as _third_candle_rising (candle+1 vs candle+2 after
+    rejected_at, decided when candle+2 closes) but generalized to pick
+    WHICHEVER direction the trend actually confirms, not just re-check the
+    original signal: a stalled BUY CE can resolve into a genuine BUY PE
+    move just as easily, and vice versa. Flat (close2 == close1, no real
+    trend either way) returns None -- there is nothing here to act on.
+
+    Returns (SIGNAL_BUY_CE | SIGNAL_BUY_PE | None, decided_at).
+    """
+    df = _as_ist(candles.get(symbol))
+    if df is None or df.empty:
+        return None, None
+
+    prior_open = rejected_at + timedelta(minutes=config.INTERVAL_MINUTES)
+    candle_open = rejected_at + timedelta(minutes=2 * config.INTERVAL_MINUTES)
+    decided_at = rejected_at + timedelta(minutes=3 * config.INTERVAL_MINUTES)
+    try:
+        close_prior = float(df.loc[prior_open, "close"])
+        close_third = float(df.loc[candle_open, "close"])
+    except KeyError:
+        return None, None
+
+    if close_third > close_prior:
+        return config.SIGNAL_BUY_CE, decided_at
+    if close_third < close_prior:
+        return config.SIGNAL_BUY_PE, decided_at
+    return None, decided_at
+
+
 def _as_ist(df: pd.DataFrame) -> pd.DataFrame:
     """
     Guarantee a tz-aware IST index.
@@ -142,6 +184,327 @@ def _as_ist(df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
         df.index = df.index.tz_convert(ist_clock.IST)
     return df
+
+
+def _macd_invalidated(final_df: pd.DataFrame, candles: dict, symbol: str,
+                      signal: str, bar_open_ts: datetime) -> bool:
+    """
+    Early-exit check (20-Aug-26, Harish, ASIANPAINT BUY CE example: entered
+    on the 09:20/09:25 trigger, the very next candle closed red with the
+    histogram fading from teal to pale-teal, and the position still ran
+    until 09:55 off the normal SL/Target ladder -- "which is not required
+    is what I feel").
+
+    Fires only when BOTH hold, on the SAME closed candle:
+      1. the UNDERLYING candle closed the opposite colour to the signal --
+         red after a BUY CE, green after a BUY PE.
+      2. that candle's MACD Recomm (from the Final sheet, not just the
+         line-vs-signal state -- see matrix_sheets.macd_recommendation) no
+         longer matches the position's own signal.
+
+    Either alone is not enough -- a red candle inside an intact MACD state
+    is normal noise (this is exactly why CANDLE_MOMENTUM_ENABLED's entry
+    gate only checks close vs close, not colour), and a fading MACD state
+    without price actually turning is not yet a broken trade. Both
+    together are what actually happened in the ASIANPAINT case.
+
+    Reads MACD Recomm specifically (not Final Recomm) -- Harish's rule was
+    stated in MACD terms only ("any of the logic mentioned above fails"),
+    not a re-vote of every confluence component.
+
+    `bar_open_ts` is the candle's OPEN-time index value, shared by the
+    underlying candle frame and the Final sheet's slot columns alike.
+    """
+    if not config.MACD_INVALIDATION_EXIT_ENABLED:
+        return False
+    if signal not in (config.SIGNAL_BUY_CE, config.SIGNAL_BUY_PE):
+        return False
+
+    und = _as_ist(candles.get(symbol))
+    if und is None or und.empty or bar_open_ts not in und.index:
+        return False  # no underlying bar to read colour from -- don't guess
+    o, c = float(und.loc[bar_open_ts, "open"]), float(und.loc[bar_open_ts, "close"])
+    opposite_colour = (c < o) if signal == config.SIGNAL_BUY_CE else (c > o)
+    if not opposite_colour:
+        return False
+
+    row = final_df[(final_df["Symbol"] == symbol)
+                   & (final_df["Metrics"] == "MACD Recomm")]
+    slot = bar_open_ts.strftime("%H:%M")
+    if row.empty or slot not in row.columns:
+        return False  # no MACD Recomm to check -- don't guess either
+    macd_now = row[slot].iloc[0]
+    macd_now = "" if pd.isna(macd_now) else str(macd_now).strip()
+    if macd_now == "":
+        return False  # still warming up -- absence of data isn't a broken signal
+
+    return macd_now != signal
+
+
+# --------------------------------------------------------------------------
+# real-position management -- shared by the 5-min bar walk
+# (advance_live_day's _advance_live_position) AND the 30-60s fast tracker
+# (fast_track_live_positions) below, module-level rather than nested
+# closures because the fast tracker fires from live_loop's on_tick callback,
+# BETWEEN advance_live_day calls, not during one -- see this module's
+# fast_track_live_positions for the full picture.
+# --------------------------------------------------------------------------
+def _retry_protective_stop(angel, pos: Position) -> None:
+    """
+    Place a protective stop that's missing (failed at entry, or after a
+    resize) -- called every time a position is touched, regardless of
+    whether new price data exists, because an unprotected live position
+    should not wait for the next tick to get one.
+    """
+    if pos.broker_stop_order_id or pos.remaining_qty <= 0:
+        return
+    contract = pos.contract
+    try:
+        pos.broker_stop_order_id = live_orders.place_protective_stop(
+            angel, contract.trading_symbol, contract.token,
+            pos.remaining_qty, pos.effective_stop)
+        pos.broker_stop_trigger = pos.effective_stop
+        print(f"[live-orders] {pos.symbol}: protective stop placed on retry")
+    except live_orders.LiveOrderError as exc:
+        print(f"[live-orders] {pos.symbol}: protective stop STILL FAILED -- "
+              f"{exc}. Position remains UNPROTECTED.")
+
+
+def _check_broker_stop_fired(angel, pos: Position, when: datetime) -> bool:
+    """
+    True (and pos is now closed) if the resting SL-M order shows COMPLETE
+    at the broker -- it already happened for real, whether this loop
+    noticed at the 5-min bar walk or the 30-60s fast tick makes no
+    difference to what to do about it: record the real fill and stop.
+    """
+    if not pos.broker_stop_order_id:
+        return False
+    row = live_orders.order_status(angel, pos.broker_stop_order_id)
+    if not row or str(row.get("status", "")).lower() != "complete":
+        return False
+
+    fill = live_orders._parse_fill(row)
+    gross = (fill.avg_price - pos.entry_ltp) * fill.filled_qty
+    cost = option_audit.estimate_round_trip_cost(
+        pos.entry_ltp, fill.avg_price, fill.filled_qty)
+    pos.remaining_qty -= fill.filled_qty
+    pos.realised_pnl += gross - cost
+    pos.exits.append({"time": when, "qty": fill.filled_qty,
+                      "ltp": fill.avg_price, "reason": "Stop Loss Hit (broker)",
+                      "gross": gross, "cost": cost, "net": gross - cost,
+                      "partial": False})
+    pos.actual_exit_price = fill.avg_price
+    pos.broker_exit_order_id = fill.order_id
+    pos.closed = True
+    pos.exit_reason = "Stop Loss Hit (broker)"
+    pos.exit_time = when
+    print(f"[live-orders] {pos.symbol}: protective stop filled at the "
+          f"broker -- {fill.avg_price:.2f}")
+    return True
+
+
+def _real_exit(angel, pos: Position, qty: int, reason: str, when: datetime,
+               is_final: bool) -> None:
+    """
+    Place a REAL exit order for `qty` units and update bookkeeping from the
+    actual fill. Raises live_orders.LiveOrderError upward on failure --
+    callers must not treat a failed exit as a closed position, see
+    live_orders.exit_live's docstring for why that matters here specifically.
+    """
+    contract = pos.contract
+    fill = live_orders.exit_live(
+        angel, contract.trading_symbol, contract.token, qty,
+        pos.broker_stop_order_id if is_final else None, reason)
+    gross = (fill.avg_price - pos.entry_ltp) * fill.filled_qty
+    cost = option_audit.estimate_round_trip_cost(
+        pos.entry_ltp, fill.avg_price, fill.filled_qty)
+    pos.remaining_qty -= fill.filled_qty
+    pos.realised_pnl += gross - cost
+    pos.exits.append({"time": when, "qty": fill.filled_qty,
+                      "ltp": fill.avg_price, "reason": reason,
+                      "gross": gross, "cost": cost, "net": gross - cost,
+                      "partial": not is_final})
+    pos.actual_exit_price = fill.avg_price
+    pos.broker_exit_order_id = fill.order_id
+    if is_final or pos.remaining_qty <= 0:
+        pos.closed = True
+        pos.exit_reason = reason
+        pos.exit_time = when
+
+
+def _evaluate_live_tick(angel, pos: Position, when: datetime, ltp: float,
+                        square_off: datetime) -> None:
+    """
+    Check ONE real, open live position against ONE price observation --
+    a genuine 30-60s live quote from the fast tracker, or one lo/hi/close
+    tick of a closed 5-min bar from _advance_live_position -- and place
+    REAL orders for whatever fires. The SAME function either way, so a
+    target does not depend on which loop happened to see it first.
+
+    Deliberately does NOT compare `ltp` against pos.stop_loss/
+    effective_stop -- for a LIVE position that comparison is the broker's
+    job (the resting SL-M order), not Python's. Call _check_broker_stop_
+    fired separately to notice when that order has already done its job.
+    Also does not check the MACD-invalidation exit -- that needs a CLOSED
+    candle's colour and Final-sheet slot, see _advance_live_position.
+    """
+    if pos.closed or ltp is None or ltp <= 0:
+        return
+    pos.peak_ltp = max(pos.peak_ltp, ltp)
+    pos.trough_ltp = min(pos.trough_ltp, ltp)
+
+    if when >= square_off:
+        try:
+            _real_exit(angel, pos, pos.remaining_qty, "EOD Square-off", when, True)
+        except live_orders.LiveOrderError as exc:
+            print(f"[live-orders] {pos.symbol}: EOD SQUARE-OFF FAILED -- {exc}")
+        return
+
+    contract = pos.contract
+    for i, target in enumerate(pos.targets):
+        if pos.target_hit[i] or ltp < target - order_sheet.PRICE_EPS:
+            continue
+        pos.target_hit[i] = True
+        is_final_target = (i == len(pos.targets) - 1)
+        qty = (pos.remaining_qty if is_final_target else
+              min(int(pos.quantity * config.TARGET_EXIT_FRACTIONS[i]),
+                  pos.remaining_qty))
+        if qty <= 0:
+            continue
+        try:
+            _real_exit(angel, pos, qty, f"Target {i + 1} Hit", when, is_final_target)
+        except live_orders.LiveOrderError as exc:
+            print(f"[live-orders] {pos.symbol}: TARGET {i + 1} EXIT FAILED "
+                  f"-- {exc}. The resting stop may now be sized for MORE "
+                  f"than what's actually held -- check by hand.")
+            continue
+        if pos.closed:
+            return
+        if i == 0 and config.MOVE_SL_TO_BREAKEVEN_AT_T1:
+            pos.breakeven_active = True
+        if pos.broker_stop_order_id:
+            try:
+                pos.broker_stop_order_id = live_orders.resize_protective_stop(
+                    angel, pos.broker_stop_order_id,
+                    contract.trading_symbol, contract.token,
+                    pos.remaining_qty, pos.effective_stop)
+                pos.broker_stop_trigger = pos.effective_stop
+            except Exception as exc:
+                print(f"[live-orders] {pos.symbol}: resizing the protective "
+                      f"stop after a target FAILED -- {exc}. Check the "
+                      f"Angel One app by hand.")
+
+    if pos.closed:
+        return
+
+    if (pos.breakeven_active and pos.broker_stop_order_id
+            and pos.effective_stop > pos.broker_stop_trigger + order_sheet.PRICE_EPS):
+        try:
+            pos.broker_stop_order_id = live_orders.update_protective_stop(
+                angel, pos.broker_stop_order_id,
+                contract.trading_symbol, contract.token,
+                pos.remaining_qty, pos.effective_stop)
+            pos.broker_stop_trigger = pos.effective_stop
+        except Exception as exc:
+            print(f"[live-orders] {pos.symbol}: trailing-stop update FAILED "
+                  f"-- {exc}. Check by hand.")
+
+
+def fast_track_live_positions(state: dict, angel, square_off: datetime) -> None:
+    """
+    30-60 second poll (config.LIVE_FAST_TRACK_INTERVAL_SECS) of every
+    currently OPEN real live position -- NOT the whole watchlist, only
+    what's actually been entered (20-Aug-26, Harish: "not all stocks to be
+    tracked here"). Called from live_loop's on_tick, in the gap between
+    candle-close cycles; see live_loop.run_live_session's docstring for why
+    it never overlaps with advance_live_day.
+
+    One batched Angel quote call for however many positions are open (same
+    getMarketData batching option_chain.fetch_quotes already uses for a
+    strike window), each evaluated through _evaluate_live_tick -- the SAME
+    core the 5-min bar walk uses, so a target or a broker-fired stop is
+    caught within this cadence instead of waiting up to 5 minutes.
+
+    Deliberately does NOT touch the MACD-invalidation exit or re-read the
+    underlying at all -- that check needs a genuinely CLOSED 5-min candle
+    (colour, and that slot's MACD Recomm off the Final sheet), neither of
+    which exists between candle closes. It stays exactly where it was, in
+    the 5-min walk. This function only ever tightens/executes what the
+    entry's own SL/Target/TSL ladder already committed to.
+    """
+    positions = [p for p in state["live_positions"].values() if not p.closed]
+    if not positions:
+        return
+
+    from option_chain import ChainWindow
+    chain = ChainWindow(symbol="", spot=0.0, atm_strike=0.0, strike_step=0.0,
+                        expiry=positions[0].contract.expiry)
+    for p in positions:
+        (chain.calls if p.contract.option_type == "CE" else chain.puts).append(p.contract)
+
+    try:
+        option_chain.fetch_quotes(chain, angel, limiter=option_data._angel_limiter)
+    except Exception as exc:
+        print(f"[live-fast] quote batch failed: {exc}")
+        return
+
+    when = ist_clock.now_ist()
+    for p in positions:
+        _retry_protective_stop(angel, p)
+        if _check_broker_stop_fired(angel, p, when):
+            continue
+        if p.contract.ltp is None:
+            continue
+        _evaluate_live_tick(angel, p, when, p.contract.ltp, square_off)
+
+    resolved = [k for k, p in state["live_positions"].items() if p.closed]
+    for key in resolved:
+        p = state["live_positions"].pop(key)
+        state["live_terminal"].append(p)
+        print(f"[live-fast] {p.symbol} resolved -> {p.exit_reason}, "
+              f"net Rs {p.realised_pnl:,.2f}")
+
+    _write_live_status_snapshot(state)
+
+
+def _write_live_status_snapshot(state: dict) -> None:
+    """
+    Overwrite paths.LIVE_STATUS_FILE with one row per currently open real
+    live position -- see that path's own docstring for why a CSV, and why
+    this exists at all (visibility between the once-per-5-min workbook
+    writes). Wholesale rewrite, not an append -- oi_log-style appending
+    would need its own daily rotation/cleanup this doesn't need, since only
+    "right now" matters for this file.
+    """
+    import csv
+    rows = []
+    for p in state["live_positions"].values():
+        rows.append({
+            "Symbol": p.symbol, "Signal": p.signal,
+            "Option": p.contract.trading_symbol,
+            "Entry LTP": round(p.entry_ltp, 2),
+            "Current LTP": round(p.contract.ltp, 2) if p.contract.ltp else "",
+            "Effective Stop": round(p.effective_stop, 2),
+            "Target 1": round(p.targets[0], 2), "T1 Hit": "YES" if p.target_hit[0] else "",
+            "Target 2": round(p.targets[1], 2), "T2 Hit": "YES" if p.target_hit[1] else "",
+            "Target 3": round(p.targets[2], 2), "T3 Hit": "YES" if p.target_hit[2] else "",
+            "Remaining Qty": p.remaining_qty,
+            "Unrealised P/L (Rs)": (round((p.contract.ltp - p.entry_ltp) * p.remaining_qty, 2)
+                                    if p.contract.ltp else ""),
+            "Realised P/L (Rs)": round(p.realised_pnl, 2),
+            "Last Update": ist_clock.now_ist().strftime("%H:%M:%S"),
+        })
+
+    path = paths.LIVE_STATUS_FILE
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        if rows:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        else:
+            f.write("no open live positions\n")
+    tmp.replace(path)  # atomic -- never leaves a half-written file to read
 
 
 def _spot_at(candles: pd.DataFrame, at: datetime) -> float | None:
@@ -453,6 +816,7 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
     # trade, then rank among those.
     eligible = []
     rsi_checkpoint_candidates: list[tuple[SignalRun, datetime]] = []
+    candle_momentum_candidates: list[tuple[SignalRun, datetime]] = []
     for run in runs:
         at = _entry_datetime(run, trade_date)
 
@@ -486,6 +850,8 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
         if not ok:
             rejections.append(make_rejection(run.symbol, run.entry_slot,
                                              run.signal, f"{run.symbol}: {note}", at))
+            if config.CANDLE_MOMENTUM_CHECKPOINT_ENABLED:
+                candle_momentum_candidates.append((run, at))
             continue
 
         eligible.append(run)
@@ -801,6 +1167,19 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
             order_sheet.update_position(pos, hi, now, square_off, bar_open=o)
             if pos.closed:
                 break
+
+            # Signal-invalidation exit (20-Aug-26) -- checked AFTER the real
+            # stop/target range for this bar (a genuine SL/Target hit still
+            # wins), only using the bar's close, because colour and MACD
+            # Recomm are only honestly knowable once the candle has closed.
+            # See _macd_invalidated's docstring for the ASIANPAINT case this
+            # is built from.
+            if _macd_invalidated(final_df, candles, symbol, signal, ts):
+                order_sheet.close_for_signal_invalidation(
+                    pos, cl, now, "MACD Invalidation")
+                if pos.closed:
+                    break
+
             order_sheet.update_position(pos, cl, now, square_off, bar_open=o)
             if pos.closed:
                 break
@@ -927,6 +1306,50 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
               f"x{pos.quantity:<6} -> {pos.exit_reason:<28} "
               f"net Rs {pos.realised_pnl:>9,.2f}")
 
+    # --- Candle-momentum checkpoint re-entry (20-Aug-26, Harish) -----------
+    # A stalled confirming candle ("no candle follow-through") isn't
+    # necessarily a dead move if the underlying is genuinely trending --
+    # check the 2 candles after the rejection and let a real trend pick a
+    # side, EITHER side, not just the original signal (see
+    # _candle_momentum_checkpoint_signal), then run it through the SAME
+    # audit gates as any other entry. Smaller risk budget, same reasoning
+    # as the RSI checkpoint above: a second chance on a trade the momentum
+    # gate itself still called stalled at the time.
+    for run, rejected_at in candle_momentum_candidates:
+        symbol = run.symbol
+        new_signal, reentry_at = _candle_momentum_checkpoint_signal(
+            symbol, candles, rejected_at)
+        if new_signal is None or reentry_at is None:
+            continue
+
+        blocked = _caps_block(reentry_at, symbol, positions, open_symbols,
+                              entries_taken, trade_date)
+        if blocked:
+            rejections.append(make_rejection(
+                symbol, run.entry_slot, new_signal,
+                f"Candle-momentum checkpoint blocked: {blocked}", reentry_at))
+            continue
+
+        checkpoint_run = SignalRun(symbol=symbol, signal=new_signal, slots=run.slots)
+        pos, reasons, _ltp2c = _try_build_position(
+            checkpoint_run, reentry_at,
+            risk_budget=config.CANDLE_MOMENTUM_CHECKPOINT_RISK_RS)
+        if pos is None:
+            for why in reasons:
+                rejections.append(make_rejection(
+                    symbol, run.entry_slot, new_signal,
+                    f"Candle-momentum checkpoint: {why}", reentry_at))
+            continue
+
+        pos.entry_type = "Candle Momentum Checkpoint (3rd Candle)"
+        positions.append(pos)
+        open_symbols.add(symbol)
+        entries_taken += 1
+        print(f"[orders] {symbol:<12} {new_signal:<7} CANDLE-MOMENTUM CHECKPOINT "
+              f"{pos.contract.trading_symbol:<24} entry {pos.entry_ltp:>8.2f} "
+              f"x{pos.quantity:<6} -> {pos.exit_reason:<28} "
+              f"net Rs {pos.realised_pnl:>9,.2f}")
+
     orders_df = order_sheet.build_orders_sheet(positions)
     rejected_df = order_sheet.build_rejected_sheet(rejections)
     missed_df = order_sheet.build_orders_sheet(shadow_positions)
@@ -1004,6 +1427,15 @@ def new_live_state() -> dict:
         # but have not resolved to an exit yet.
         "open_runs": {},
         "terminal": [],           # resolved Position objects
+        # REAL broker positions (20-Aug-26, live_orders.py), only ever
+        # populated when config.LIVE_TRADING is True. Deliberately a
+        # SEPARATE dict from open_runs/terminal -- those are replayed fresh
+        # from their entry snapshot every cycle (safe, since it's only
+        # simulating against historical candles); a real broker order
+        # cannot be replayed, so a live Position is built ONCE at entry and
+        # mutated in place cycle to cycle. See _advance_live_position.
+        "live_positions": {},     # (symbol, entry_slot) -> Position, still open
+        "live_terminal": [],      # resolved (real) Position objects
         "rejections": [],
         # Same shape as open_runs/terminal, for runs blocked ONLY by the
         # concurrent-position cap -- simulated as if the book had room, so
@@ -1032,6 +1464,12 @@ def new_live_state() -> dict:
         # exactly once, as soon as that 3rd candle has closed.
         "rsi_checkpoint_pending": {},
         "rsi_checkpoint_checked": set(),
+        # Candle-momentum checkpoint re-entry (20-Aug-26, Harish) -- same
+        # shape as rsi_checkpoint_pending/_checked above, for every run
+        # rejected ONLY by signal_quality.candle_momentum_ok ("no candle
+        # follow-through"). See _candle_momentum_checkpoint_signal.
+        "candle_momentum_pending": {},
+        "candle_momentum_checked": set(),
     }
 
 
@@ -1042,6 +1480,7 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
                      index_candles: pd.DataFrame | None = None,
                      vix_candles: pd.DataFrame | None = None,
                      kite=None,
+                     oi_buildup_enabled: bool = False,
                      ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame,
                                pd.DataFrame, pd.DataFrame]:
     """
@@ -1148,6 +1587,10 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
         if not ok:
             state["rejections"].append(make_rejection(
                 run.symbol, run.entry_slot, run.signal, f"{run.symbol}: {note}", at))
+            if config.CANDLE_MOMENTUM_CHECKPOINT_ENABLED:
+                state["candle_momentum_pending"][(run.symbol, run.entry_slot)] = {
+                    "run": run, "rejected_at": at,
+                }
             continue
         eligible.append(run)
 
@@ -1191,9 +1634,9 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
         whether a shadow trade can be promoted into the real book.
         """
         realised_so_far = sum(
-            p.realised_pnl for p in state["terminal"]
+            p.realised_pnl for p in state["terminal"] + state["live_terminal"]
             if p.exit_time is not None and p.exit_time <= check_at)
-        live_now_ct = len(state["open_runs"])
+        live_now_ct = len(state["open_runs"]) + len(state["live_positions"])
         hh, mm = (int(x) for x in config.NO_NEW_ENTRY_AFTER.split(":"))
         entry_cutoff = ist_clock.combine_ist(
             trade_date, ist_clock.MARKET_OPEN.replace(hour=hh, minute=mm))
@@ -1338,6 +1781,23 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
             return None, "", [f"{contract.trading_symbol}: {why}"
                               for why in audit.reasons]
 
+        # OI CHANGE / buildup GATE (20-Aug-26, Harish: "check for Rise in OI
+        # & Rise in Price... only if trending... else ignore"). Already
+        # built and running in BACKTEST (process_date, identical call) but
+        # never wired into LIVE -- classify_oi_buildup above only ever
+        # populated the display column here, nothing gated on it. Only
+        # LONG_BUILDUP (price up AND OI up) confirms a BUY CE, only
+        # SHORT_BUILDUP (price down AND OI up) confirms a BUY PE --
+        # SHORT_COVERING and LONG_UNWINDING confirm neither direction,
+        # whichever way price moved. Same placement as process_date's
+        # identical block (after audit_option, before the fill) so a
+        # rejection reason lines up the same way in both paths. See
+        # option_audit.oi_buildup_confirms.
+        if oi_buildup_enabled:
+            ok, note = option_audit.oi_buildup_confirms(opt_candles, entry_at, signal)
+            if not ok:
+                return None, "", [f"{contract.trading_symbol}: {note}"]
+
         fill_rows = opt_candles[opt_candles.index >= entry_at]
         if fill_rows.empty:
             return None, "", [f"{contract.trading_symbol}: no candle at or after "
@@ -1401,6 +1861,82 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
         )
         return entry_snapshot, opt_type, []
 
+    def _open_position(key: tuple, symbol: str, signal: str, snap: dict,
+                       opt_type: str, label: str) -> bool:
+        """
+        Accept one entry snapshot into the book -- PAPER (unchanged
+        behaviour, replayed each cycle) when config.LIVE_TRADING is False,
+        a REAL Angel One order when it's True. Shared by all three entry
+        paths (normal, RSI-checkpoint re-entry, shadow promotion) so none
+        of them can accidentally skip real order placement.
+
+        Returns True if the position was opened (paper or live), False if a
+        live order attempt failed -- caller should reject/skip on False,
+        never fall back to treating a failed live order as a paper fill.
+        """
+        if not config.LIVE_TRADING:
+            state["open_runs"][key] = {"snapshot": snap, "opt_type": opt_type}
+            state["open_symbols"].add(symbol)
+            state["entries_taken"] += 1
+            print(f"[live-orders] {symbol:<12} {signal:<7} "
+                  f"{snap['contract'].trading_symbol:<24} "
+                  f"ENTERED {snap['entry_ltp']:>8.2f} x{snap['quantity']:<6} "
+                  f"-- PAPER, now tracking{label}")
+            return True
+
+        entry_slot = key[1]
+        if live_orders.kill_switch_active():
+            state["rejections"].append(make_rejection(
+                symbol, entry_slot, signal,
+                f"live kill switch active ({paths.LIVE_KILL_SWITCH_FILE.name} "
+                f"exists) -- no new live entries", ist_clock.now_ist()))
+            print(f"[live-orders] {symbol}: kill switch active -- skipping "
+                  f"live entry{label}")
+            return False
+
+        contract = snap["contract"]
+        try:
+            fill = live_orders.enter_live(
+                angel, contract.trading_symbol, contract.token, snap["quantity"])
+        except live_orders.LiveOrderError as exc:
+            print(f"[live-orders] {symbol}: LIVE ENTRY FAILED{label} -- {exc}")
+            state["rejections"].append(make_rejection(
+                symbol, entry_slot, signal,
+                f"live entry order failed: {exc}", ist_clock.now_ist()))
+            return False
+
+        real_qty = fill.filled_qty
+        real_lots = max(real_qty // contract.lot_size, 1)
+        pos = Position(**{**snap, "entry_ltp": fill.avg_price,
+                          "quantity": real_qty, "lots": real_lots})
+        pos.trade_mode = "LIVE"
+        pos.broker_entry_order_id = fill.order_id
+        pos.actual_fill_price = fill.avg_price
+
+        try:
+            pos.broker_stop_order_id = live_orders.place_protective_stop(
+                angel, contract.trading_symbol, contract.token,
+                real_qty, pos.stop_loss)
+        except live_orders.LiveOrderError as exc:
+            # The entry already filled for real -- discarding the position
+            # now would leave a live position nobody is tracking, which is
+            # worse than one tracked with no resting stop yet. Flag loudly;
+            # _advance_live_position retries placing the stop every cycle
+            # until it succeeds (see its own docstring).
+            print(f"[live-orders] {symbol}: ENTERED LIVE but the protective "
+                  f"stop FAILED to place -- {exc}. Position is UNPROTECTED "
+                  f"until the next cycle retries. Check the Angel One app "
+                  f"by hand, now.")
+
+        state["live_positions"][key] = pos
+        state["open_symbols"].add(symbol)
+        state["entries_taken"] += 1
+        print(f"[live-orders] {symbol:<12} {signal:<7} "
+              f"{contract.trading_symbol:<24} LIVE ENTRY {fill.avg_price:>8.2f} "
+              f"x{real_qty:<6} -- REAL ORDER (entry {fill.order_id}, "
+              f"stop {pos.broker_stop_order_id or 'FAILED'}){label}")
+        return True
+
     for run in runs_ranked:
         symbol, signal = run.symbol, run.signal
         entry_at = _entry_datetime(run, trade_date)
@@ -1452,15 +1988,8 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
                     }
             continue
 
-        state["open_runs"][(symbol, run.entry_slot)] = {
-            "snapshot": snap, "opt_type": opt_type,
-        }
-        state["open_symbols"].add(symbol)
-        state["entries_taken"] += 1
-        print(f"[live-orders] {symbol:<12} {signal:<7} "
-              f"{snap['contract'].trading_symbol:<24} "
-              f"ENTERED {snap['entry_ltp']:>8.2f} x{snap['quantity']:<6} "
-              f"-- now tracking live")
+        _open_position((symbol, run.entry_slot), symbol, signal, snap,
+                       opt_type, "")
 
     # --- RSI-checkpoint re-entry (16-Aug-26, Harish) ------------------------
     # Same idea as process_date's identical block: a signal rejected ONLY by
@@ -1498,13 +2027,52 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
             continue
 
         snap["entry_type"] = "RSI Checkpoint (3rd Candle)"
-        state["open_runs"][key] = {"snapshot": snap, "opt_type": opt_type}
-        state["open_symbols"].add(symbol)
-        state["entries_taken"] += 1
-        print(f"[live-orders] {symbol:<12} {signal:<7} RSI-CHECKPOINT "
-              f"RE-ENTRY {snap['contract'].trading_symbol:<24} "
-              f"ENTERED {snap['entry_ltp']:>8.2f} x{snap['quantity']:<6} "
-              f"-- now tracking live")
+        _open_position(key, symbol, signal, snap, opt_type,
+                       " (RSI-checkpoint re-entry)")
+
+    # --- Candle-momentum checkpoint re-entry (20-Aug-26, Harish) -----------
+    # Same idea as the RSI checkpoint above: a stalled confirming candle
+    # ("no candle follow-through") isn't necessarily a dead move if the
+    # underlying is genuinely trending. Checked exactly once per pending
+    # key, as soon as its 2nd subsequent candle has closed -- see
+    # _candle_momentum_checkpoint_signal, which picks WHICHEVER side the
+    # trend actually confirms, not just the original signal.
+    for key, info in list(state["candle_momentum_pending"].items()):
+        if key in state["candle_momentum_checked"]:
+            continue
+        run, rejected_at = info["run"], info["rejected_at"]
+        symbol = run.symbol
+        third_close_at = rejected_at + timedelta(minutes=3 * config.INTERVAL_MINUTES)
+        if now < third_close_at:
+            continue  # 2nd subsequent candle hasn't closed yet -- retry next cycle
+        state["candle_momentum_checked"].add(key)
+
+        new_signal, reentry_at = _candle_momentum_checkpoint_signal(
+            symbol, candles, rejected_at)
+        if new_signal is None or reentry_at is None:
+            continue
+
+        blocked = _live_caps_block(symbol, reentry_at)
+        if blocked:
+            state["rejections"].append(make_rejection(
+                symbol, run.entry_slot, new_signal,
+                f"Candle-momentum checkpoint blocked: {blocked}", reentry_at))
+            continue
+
+        checkpoint_run = SignalRun(symbol=symbol, signal=new_signal, slots=run.slots)
+        snap, opt_type, reasons = _try_build_snapshot(
+            checkpoint_run, reentry_at,
+            risk_budget=config.CANDLE_MOMENTUM_CHECKPOINT_RISK_RS)
+        if snap is None:
+            for why in reasons:
+                state["rejections"].append(make_rejection(
+                    symbol, run.entry_slot, new_signal,
+                    f"Candle-momentum checkpoint: {why}", reentry_at))
+            continue
+
+        snap["entry_type"] = "Candle Momentum Checkpoint (3rd Candle)"
+        _open_position(key, symbol, new_signal, snap, opt_type,
+                       " (candle-momentum checkpoint re-entry)")
 
     # --- shadow promotion: "wait for next 2 candles and see the performance"
     # (07-Aug-26, Harish). Checked exactly once per shadow run, as soon as 2
@@ -1544,12 +2112,11 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
             continue
 
         del state["shadow_open_runs"][key]
-        state["open_runs"][key] = info
-        state["open_symbols"].add(symbol)
-        state["entries_taken"] += 1
-        print(f"[live-orders] {symbol} PROMOTED to Paper Trading -- trending "
-              f"up 2 candles after entry ({ltp_at_mark:.2f} vs entry "
+        print(f"[live-orders] {symbol} PROMOTED -- trending up 2 candles "
+              f"after entry ({ltp_at_mark:.2f} vs entry "
               f"{snap['entry_ltp']:.2f}), room now in the book")
+        _open_position(key, symbol, snap["signal"], snap, info["opt_type"],
+                       " (promoted from shadow)")
 
     # --- advance every still-open run with whatever candles exist now ------
     def _advance_open_runs(open_runs: dict, terminal: list,
@@ -1593,6 +2160,18 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
                     order_sheet.update_position(pos, hi, bar_now, square_off, bar_open=o)
                     if pos.closed:
                         break
+
+                    # Signal-invalidation exit (20-Aug-26) -- see
+                    # _macd_invalidated's docstring. Same placement as the
+                    # BACKTEST walk in _try_build_position: after the real
+                    # stop/target range for this bar, using the bar's close.
+                    if _macd_invalidated(final_df, candles, pos.symbol,
+                                         pos.signal, ts):
+                        order_sheet.close_for_signal_invalidation(
+                            pos, cl, bar_now, "MACD Invalidation")
+                        if pos.closed:
+                            break
+
                     order_sheet.update_position(pos, cl, bar_now, square_off, bar_open=o)
                     if pos.closed:
                         break
@@ -1615,6 +2194,97 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
             del open_runs[key]
         return rows
 
+    def _advance_live_position(pos: Position) -> tuple[Position, float | None]:
+        """
+        Advance ONE real broker position by whatever NEW option candles
+        exist since pos.last_processed_bar, placing REAL orders for
+        whatever fires. Mutates `pos` in place -- never rebuilt from a
+        snapshot, unlike _advance_open_runs' PAPER replay, because a real
+        broker order cannot be replayed. See new_live_state's docstring.
+
+        Priority within a bar, same spirit as order_sheet.update_position:
+        a broker-side stop that already fired wins first (it already
+        happened, for real, whether this loop agrees or not), then EOD,
+        then the MACD-invalidation exit (candle-close only, see
+        _macd_invalidated), then targets/trailing via _evaluate_live_tick --
+        the SAME per-observation core the 30-60s fast tracker uses (see
+        fast_track_live_positions), called here once per lo/hi/close tick
+        so a target reachable only intrabar is still caught.
+        """
+        contract = pos.contract
+        opt_type = "CE" if pos.signal == config.SIGNAL_BUY_CE else "PE"
+        _retry_protective_stop(angel, pos)
+
+        opt_candles, _src = _fetch_opt_candles(
+            contract, pos.symbol, opt_type, trade_date, angel, kite,
+            nfo_instruments, now)
+
+        current_ltp = None
+        if opt_candles is not None and not opt_candles.empty:
+            current_ltp = float(opt_candles["close"].iloc[-1])
+            new_bars = opt_candles[opt_candles.index > pos.entry_time]
+            if pos.last_processed_bar is not None:
+                new_bars = new_bars[new_bars.index > pos.last_processed_bar]
+
+            for ts, bar in new_bars.iterrows():
+                if pos.closed:
+                    break
+                bar_now = ts.to_pydatetime() + timedelta(minutes=config.INTERVAL_MINUTES)
+                o, hi, lo, cl = (float(bar["open"]), float(bar["high"]),
+                                 float(bar["low"]), float(bar["close"]))
+                if o > 0 and (o - lo) / o > config.MAX_INTRABAR_COLLAPSE:
+                    lo = min(o, cl)
+                pos.last_processed_bar = ts
+
+                if _check_broker_stop_fired(angel, pos, bar_now):
+                    break
+
+                # --- signal invalidation (20-Aug-26) -- candle-close only,
+                # needs THIS bar's colour and its MACD Recomm slot, neither
+                # of which exists between candle closes (see the fast
+                # tracker's docstring for why it can't run this check).
+                if _macd_invalidated(final_df, candles, pos.symbol,
+                                     pos.signal, ts):
+                    try:
+                        _real_exit(angel, pos, pos.remaining_qty,
+                                  "MACD Invalidation", bar_now, True)
+                    except live_orders.LiveOrderError as exc:
+                        print(f"[live-orders] {pos.symbol}: MACD-INVALIDATION "
+                              f"EXIT FAILED -- {exc}")
+                    break
+
+                _evaluate_live_tick(angel, pos, bar_now, lo, square_off)
+                if pos.closed:
+                    break
+                _evaluate_live_tick(angel, pos, bar_now, hi, square_off)
+                if pos.closed:
+                    break
+                _evaluate_live_tick(angel, pos, bar_now, cl, square_off)
+                if pos.closed:
+                    break
+
+        return pos, current_ltp
+
+    def _advance_live_positions() -> list[tuple]:
+        """Same shape as _advance_open_runs' return value, for the real
+        broker book. Resolved positions move into state['live_terminal']."""
+        resolved_keys = []
+        rows: list[tuple] = []
+        for key, pos in state["live_positions"].items():
+            pos, current_ltp = _advance_live_position(pos)
+            if pos.closed:
+                resolved_keys.append(key)
+                state["live_terminal"].append(pos)
+                print(f"[live-orders] [LIVE] {pos.symbol} resolved -> "
+                      f"{pos.exit_reason}, net Rs {pos.realised_pnl:,.2f}")
+            else:
+                rows.append((pos, current_ltp))
+        for key in resolved_keys:
+            del state["live_positions"][key]
+        return rows
+
+    live_open_rows = _advance_live_positions()
+
     open_rows = _advance_open_runs(state["open_runs"], state["terminal"], "")
     shadow_open_rows = _advance_open_runs(
         state["shadow_open_runs"], state["shadow_terminal"], " [shadow]")
@@ -1624,8 +2294,10 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
     oi_open_rows = _advance_open_runs(
         state["oi_shadow_open_runs"], state["oi_shadow_terminal"], " [oi-shadow]")
 
-    real_positions = state["terminal"] + [p for p, _ in open_rows]
-    real_ltps = [None] * len(state["terminal"]) + [c for _, c in open_rows]
+    real_positions = (state["terminal"] + state["live_terminal"]
+                      + [p for p, _ in open_rows] + [p for p, _ in live_open_rows])
+    real_ltps = ([None] * len(state["terminal"]) + [None] * len(state["live_terminal"])
+                + [c for _, c in open_rows] + [c for _, c in live_open_rows])
 
     orders_df = order_sheet.build_orders_sheet(real_positions, real_ltps)
     rejected_df = order_sheet.build_rejected_sheet(state["rejections"])

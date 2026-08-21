@@ -197,11 +197,28 @@ class Position:
     # "Short Buildup" / "Long Unwinding", or "" when there wasn't enough OI
     # history to classify. Display only; option_audit.classify_oi_buildup.
     oi_check: str = ""
-    # "LIVE" once a real broker-order module exists and LIVE_TRADING is set;
-    # every position today is "PAPER" (simulated fill, no order placed).
-    # Dashboard splits on this so a real fill and a simulated one are never
-    # blended into one headline number.
+    # "LIVE" once config.LIVE_TRADING is True and live_orders.py actually
+    # placed a real order for this position; every position before 20-Aug-26
+    # was "PAPER" (simulated fill, no order placed) because no order-
+    # placement module existed. Dashboard splits on this so a real fill and
+    # a simulated one are never blended into one headline number.
     trade_mode: str = "PAPER"
+
+    # Real broker order tracking (20-Aug-26, live_orders.py). Blank for
+    # every PAPER position -- only populated when trade_mode == "LIVE".
+    broker_entry_order_id: str = ""
+    broker_stop_order_id: str = ""      # the CURRENT resting SL-M order id
+    broker_stop_trigger: float = 0.0    # trigger price that order is resting at
+    broker_exit_order_id: str = ""
+    actual_fill_price: float = 0.0      # what the broker really filled at,
+                                        # vs entry_ltp which is the intended price
+    actual_exit_price: float = 0.0
+    # Timestamp of the last option candle already acted on for this LIVE
+    # position -- unlike the PAPER path, a real position is never replayed
+    # from scratch each cycle (broker orders aren't replayable), so this is
+    # what keeps a repeat cycle from re-evaluating, and re-ordering against,
+    # a bar it already handled. Always None for PAPER positions.
+    last_processed_bar: datetime | None = None
 
     # The moment the third bar of the trio CLOSED -- i.e. the earliest instant
     # this trade could honestly have been known about. Recorded so the gap
@@ -239,7 +256,21 @@ class Position:
 
     @property
     def risk_per_unit(self) -> float:
-        return self.entry_ltp - (self.entry_ltp * config.STOP_LOSS_MULT)
+        """
+        Actual risk per unit, from the REAL stop (self.stop_loss, ATR-based
+        when USE_ATR_STOP is on) -- not the flat STOP_LOSS_MULT assumption
+        this used to return regardless of what stop was actually set.
+
+        BUG FOUND 19-Aug-26 (Harish, reviewing a NESTLEIND loss against his
+        stop): this fed the Orders sheet's 'Risk/Unit (Rs)' / 'Risk Amount
+        (Rs)' columns and silently understated them whenever the ATR stop
+        was wider than flat 7% -- NESTLEIND showed Risk Amount Rs 976.50
+        when the real stop (8.18 vs entry 9.30) put it at ~Rs 1,680. Sizing
+        itself (order_sheet.size_position) was never affected -- it always
+        computed off compute_stop_price() correctly. This was a reporting
+        bug only, but a materially misleading one.
+        """
+        return max(self.entry_ltp - self.stop_loss, 0.0)
 
     @property
     def r_multiple(self) -> float:
@@ -410,6 +441,19 @@ def update_position(pos: Position, ltp: float, now: datetime,
             pos.breakeven_active = True
 
     return fired
+
+
+def close_for_signal_invalidation(pos: Position, ltp: float, now: datetime,
+                                  reason: str) -> dict | None:
+    """
+    Force-close a position outside the normal SL/Target/TSL ladder, for a
+    reason the ladder itself has no concept of -- the entry signal broke
+    (20-Aug-26, see order_engine._macd_invalidated). Public wrapper around
+    _close() so order_engine doesn't reach into a private function.
+    """
+    if pos.closed or ltp is None or ltp <= 0:
+        return None
+    return _close(pos, ltp, now, reason)
 
 
 def _partial(pos: Position, ltp: float, now: datetime, qty: int,
@@ -594,8 +638,12 @@ def position_to_row(pos: Position, current_ltp: float | None = None) -> dict:
         "Exit Time": pos.exit_time.strftime("%H:%M:%S") if pos.exit_time else "",
         "Exit Reason": pos.exit_reason,
         "Trade Mode": pos.trade_mode,
-        "Broker Order ID": "",
-        "Actual Fill Price": "", "Actual Exit Price": "", "Exit Order ID": "",
+        "Broker Order ID": pos.broker_entry_order_id,
+        "Actual Fill Price": (round(pos.actual_fill_price, 2)
+                              if pos.actual_fill_price else ""),
+        "Actual Exit Price": (round(pos.actual_exit_price, 2)
+                              if pos.actual_exit_price else ""),
+        "Exit Order ID": pos.broker_exit_order_id,
     }
 
 

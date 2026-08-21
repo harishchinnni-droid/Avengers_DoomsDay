@@ -15,10 +15,30 @@ from dataclasses import dataclass, field
 # --------------------------------------------------------------------------
 # MASTER SAFETY SWITCH
 # --------------------------------------------------------------------------
-# This pipeline (steps 1-8) does not place orders at all. The flag exists so
-# the order module added later has something to check, and so it defaults to
-# off from the very first commit rather than being bolted on afterwards.
-LIVE_TRADING = False
+# ON since 20-Aug-26, Harish's explicit call ("full auto-fire from day
+# one" -- asked directly, after being told this had never placed a real
+# order before). When True, a signal that clears every audit gate in a
+# LIVE session (run_live_day / advance_live_day only -- BACKTEST's
+# process_date never places real orders, regardless of this flag) is
+# placed for real on Angel One via live_orders.py: MARKET entry, a
+# broker-side SL-M protective stop the moment that entry confirms filled,
+# real partial exits at targets, real stop moves for breakeven/trailing,
+# and a real EOD square-off.
+#
+# TO STOP NEW LIVE ENTRIES INSTANTLY without touching this file or
+# restarting a running session: create paths.LIVE_KILL_SWITCH_FILE
+# (F:\02_Avengers_13-Aug-26\STOP_LIVE_TRADING.flag -- an empty file is
+# enough). Checked before every new entry; does not affect managing
+# positions already open, those still get real exits. Delete the file to
+# resume. To go back to paper simulation entirely, set this flag to False.
+#
+# BEFORE THE NEXT LIVE SESSION, CONFIRM BY HAND (none of this is checked
+# by code): Angel One F&O segment is active and has sufficient margin;
+# harish_angel_one.json is current; you are comfortable with
+# RISK_PER_TRADE_RS / DAILY_MAX_LOSS_RS below at real money; and ideally,
+# start one session at reduced size before trusting this at normal size --
+# nothing here has traded a real rupee yet.
+LIVE_TRADING = True
 
 # The per-run KPI sheet (dashboard.py) -- KPI panels, per-symbol/exit-reason/
 # equity/hourly/rotation tables, no native Excel charts (charts were tried
@@ -317,6 +337,23 @@ RSI_EXTREME_OVERSOLD = 20.0       # was 30.0, lowered 15-Aug-26 at Harish's requ
 RSI_CHECKPOINT_REENTRY_ENABLED = True
 RSI_CHECKPOINT_REENTRY_RISK_RS = 750.0   # vs RISK_PER_TRADE_RS (Rs 2000) normally
 
+# CANDLE-MOMENTUM CHECKPOINT (20-Aug-26, Harish -- example: Pre-Entry 09:45
+# close 2021, confirming candle 09:50 close 2020.6, rejected by
+# signal_quality.candle_momentum_ok for "no candle follow-through": "check
+# for the 2nd subsequent candle also. Incase if the overall stock price is
+# trending then there is a potential of making profit either on BUY CE or
+# BUY PE. Hence, check for 02 subsequent candles for a entry and then lets
+# Audit step finalize."). Same shape as the RSI checkpoint above (candle+1
+# vs candle+2 after the rejection, decided when candle+2 closes), but
+# generalized to pick WHICHEVER side the trend actually confirms -- not
+# just re-confirm the original signal, since a stalled BUY CE can resolve
+# into a real BUY PE move just as easily. Every other gate (audit, sizing,
+# caps) still applies exactly as normal -- this only gets a rejected run a
+# second look. See order_engine._candle_momentum_checkpoint_signal.
+CANDLE_MOMENTUM_CHECKPOINT_ENABLED = True
+CANDLE_MOMENTUM_CHECKPOINT_RISK_RS = 750.0  # vs RISK_PER_TRADE_RS (Rs 2000) normally --
+                                            # same reduced-bet reasoning as the RSI checkpoint
+
 # --- INDIA VIX GATE (adopted from F:\06_Claude_v2, VIX_MAX = 18.0) --------
 # Per-option IV asks "is THIS contract expensive?". VIX asks "is the whole
 # market expensive?" -- they catch different things. A high-VIX day makes
@@ -501,11 +538,30 @@ NO_FOLLOW_THROUGH_MINS = 20       # flat after this long
 NO_FOLLOW_THROUGH_R = 0.5         # "flat" = less than this many R in profit
 MAX_HOLD_MINS = 75
 
+# MACD SIGNAL-INVALIDATION EXIT (added 20-Aug-26, Harish -- ASIANPAINT
+# example: BUY CE entered on the 09:20/09:25 trigger, the very next candle
+# closed red with the histogram fading from teal to pale-teal, and the
+# position still ran on the normal SL/Target ladder until 09:55, which he
+# called out as not needed). Checked every closed candle after entry, not
+# just the first one -- fires only when BOTH hold on the SAME bar: the
+# UNDERLYING candle closes the opposite colour to the signal, AND that
+# candle's MACD Recomm no longer matches the position's signal. Either one
+# alone is normal noise; both together is what actually happened in his
+# example. See order_engine._macd_invalidated.
+MACD_INVALIDATION_EXIT_ENABLED = True
+
 # --------------------------------------------------------------------------
 # OPTION AUDIT GATES
 # --------------------------------------------------------------------------
 # Liquidity and tradeability.
-MIN_OPTION_LTP = 5.0              # below this the tick is a large % of premium
+MIN_OPTION_LTP = 3.0              # below this the tick is a large % of premium
+                                  # was 5.0, lowered 20-Aug-26 at Harish's
+                                  # request: close to expiry, a real,
+                                  # tradeable premium is often under Rs 5 --
+                                  # trying 3 rather than excluding those
+                                  # contracts outright. Revert if the tick-
+                                  # noise problem this gate exists for shows
+                                  # up in the Rs 3-5 band specifically.
 MAX_SPREAD_PCT = 0.05             # bid-ask wider than 5% of LTP -> reject
 MIN_OPTION_VOLUME = 100
 
@@ -614,6 +670,17 @@ OBSERVED_ALL_IN_COST_PCT = 0.00654
 CANDLE_CLOSE_BUFFER_SECS = 5
 LIVE_POLL_TOLERANCE_SECS = 2      # how close to the mark the loop must wake
 
+# FAST SL/TARGET/TSL TRACKING (20-Aug-26, Harish: "SL/Target/TSL should be
+# computed at 30 or 60 seconds for the orders which are placed... instead
+# of waiting for 5 mins closure"). Only ever touches symbols with a REAL
+# open live position -- never the whole watchlist, see
+# order_engine.fast_track_live_positions. Runs in the gap between candle-
+# close cycles; live_loop.run_live_session pauses it automatically the
+# moment a real 5-min candle close is due, runs that cycle (which can also
+# move SL/Target/TSL, off the closed candle), then resumes ticking -- the
+# two never run at the same time, so there is nothing to race.
+LIVE_FAST_TRACK_INTERVAL_SECS = 30
+
 
 @dataclass(frozen=True)
 class SignalRules:
@@ -663,18 +730,24 @@ RULES = SignalRules()
 # EMA VWAP REMOVED (16-Aug-26, Harish: "keep only TW, RSI & ADX indicator
 # and Final & Order sheet"). Was already hidden from the workbook since
 # 15-Aug-26 (EMA_VWAP_SHEET_ENABLED=False); now dropped from computation
-# and Final Recomm's confluence entirely, not just the display. Final
-# Recomm is back to the original 3-way TW ALL / RSI / ADX vote.
+# and Final Recomm's confluence entirely, not just the display.
+#
+# MACD ADDED (20-Aug-26, Harish: "enable MACD indicator for confluence").
+# Final Recomm is now a 4-way TW ALL / RSI / ADX / MACD vote. Uses the same
+# macd.py module and MACD_FAST_LENGTH/SLOW/SIGNAL settings already built
+# for run_MACD.py's separate RSI+MACD pipeline (see matrix_sheets_v2.py) --
+# same rule, macd_recommendation() in matrix_sheets.py, now shared by both.
 
 # Which sheets get built, and the metric rows each one carries.
 MATRIX_SHEETS: dict[str, list[str]] = {
     "TW ALL": ["Close", "N-Line", "MHULL", "SHULL", "TREND", "TW ALL Recomm"],
     "RSI": ["Close", "RSI", "RSI EMA9", "RSI Recomm"],
     "ADX": ["DI+", "DI-", "ADX", "ADX Recomm"],
+    "MACD": ["Close", "MACD", "Signal", "Hist", "MACD Recomm"],
 }
 
 FINAL_SHEET_NAME = "Final"
-FINAL_ROWS = ["TW ALL Recomm", "RSI Recomm", "ADX Recomm", "Final Recomm"]
+FINAL_ROWS = ["TW ALL Recomm", "RSI Recomm", "ADX Recomm", "MACD Recomm", "Final Recomm"]
 
 SIGNAL_BUY_CE = "BUY CE"
 SIGNAL_BUY_PE = "BUY PE"
@@ -809,6 +882,9 @@ def describe_rules() -> str:
            else " (rising = CE, falling = PE)" if RULES.rsi_mode == "direction"
            else f" (upper {RULES.rsi_upper} / lower {RULES.rsi_lower})")
         + f"\n  ADX gate     : >= {RULES.adx_min} then DI+/DI- picks the side\n"
+        f"  MACD         : ({MACD_FAST_LENGTH},{MACD_SLOW_LENGTH},{MACD_SIGNAL_LENGTH}) "
+        f"line above signal & histogram bright teal = CE, below & bright red = PE, "
+        f"else WAIT\n"
         f"  EMA-VWAP     : close above EMA{EMA_VWAP_LENGTH} & VWAP({VWAP_SOURCE}) = CE, "
         f"below both = PE, else WAIT\n"
         f"  Confluence   : {RULES.confluence} of "

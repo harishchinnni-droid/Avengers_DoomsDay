@@ -48,6 +48,25 @@ SOURCE_FILE: Path = BASE_DIR / "01_SourceFile.xlsx"
 ANGEL_CRED_FILE: Path = JSON_DIR / "harish_angel_one.json"
 ZERODHA_CRED_FILE: Path = JSON_DIR / "harish_zerodha.json"
 
+# LIVE TRADING KILL SWITCH (20-Aug-26). If this file exists, live_orders.py
+# refuses to place any NEW entry order -- create it by hand (an empty file
+# is enough, e.g. `type nul > STOP_LIVE_TRADING.flag` on Windows) to halt
+# new live trades instantly without touching code or restarting the running
+# process. Does not touch positions already open -- those still need their
+# exits managed and placed for real. Delete the file to resume.
+LIVE_KILL_SWITCH_FILE: Path = BASE_DIR / "STOP_LIVE_TRADING.flag"
+
+# LIVE POSITION FAST-TRACK SNAPSHOT (20-Aug-26). Rewritten wholesale every
+# LIVE_FAST_TRACK_INTERVAL_SECS by order_engine.fast_track_live_positions --
+# one row per currently OPEN real position (never the whole watchlist), so
+# Harish can watch SL/Target/TSL levels move without opening the dated
+# workbook (which only updates once per 5-min cycle, and Excel locks the
+# file for reading while it's mid-write anyway). CSV, not xlsx -- same
+# reasoning as oi_log.py/quote_history.py: a CSV survives a torn read from
+# being rewritten every 30-60s by a process that's also busy elsewhere; an
+# xlsx is a zip archive that doesn't.
+LIVE_STATUS_FILE: Path = BASE_DIR / "Live_Position_Tracker.csv"
+
 # Caches, all date-keyed so a same-day re-run reuses instead of re-fetching
 ZERODHA_TOKEN_CACHE: Path = JSON_DIR / "zerodha_access_token.json"
 ANGEL_TOKEN_CACHE: Path = JSON_DIR / "angel_one_access_token.json"

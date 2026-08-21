@@ -27,8 +27,12 @@ Steps 9-11 need an Angel One session. Without one the run still produces the
 matrix sheets and says plainly that the order sheets were skipped -- it does
 not write empty Orders/Rejected sheets that look like "no signals today".
 
-NOTHING HERE PLACES A BROKER ORDER. Every position is PAPER until
-config.LIVE_TRADING is True and an order-placement module exists.
+ORDER PLACEMENT (20-Aug-26): a LIVE session (not BACKTEST -- see
+run_live_day/advance_live_day) places REAL orders on Angel One via
+live_orders.py whenever config.LIVE_TRADING is True. See that flag's own
+comment in config.py for the kill switch and what to confirm before
+trusting it. BACKTEST (run_one_date/process_date) never places a real
+order regardless of this flag -- it only ever simulates against past data.
 """
 
 from __future__ import annotations
@@ -410,7 +414,8 @@ def run_live_day(trade_date: date, kite, angel) -> None:
              oi_blocked_df) = order_engine.advance_live_day(
                 state, final_df, df_ref_now, candles, scrip, angel, trade_date,
                 config.LIVE, slots, available_capital=capital,
-                index_candles=index_candles, vix_candles=vix_candles, kite=kite)
+                index_candles=index_candles, vix_candles=vix_candles, kite=kite,
+                oi_buildup_enabled=config.TW_ALL_OI_BUILDUP_ENABLED)
 
             file_mgmt.write_sheet(workbook, "Orders", orders_df)
             file_mgmt.write_sheet(workbook, "Rejected", rejected_df)
@@ -431,7 +436,25 @@ def run_live_day(trade_date: date, kite, angel) -> None:
         excel_format.format_workbook(workbook)
         print(f"[live] {slot} cycle done -> {workbook.name}")
 
-    live_loop.run_live_session(on_candle, trade_date)
+    # Fast SL/Target/TSL tracker (20-Aug-26, Harish): every
+    # config.LIVE_FAST_TRACK_INTERVAL_SECS seconds IN BETWEEN candle
+    # closes, not instead of them -- live_loop.run_live_session stops
+    # calling this the instant the next candle's fetch time is due, runs
+    # on_candle, then resumes. Only ever touches symbols with a REAL open
+    # live position (state["live_positions"]), never the whole watchlist.
+    # A no-op whenever that's empty, which covers both "no Angel session"
+    # and "LIVE_TRADING is False" without a separate guard.
+    square_off = ist_clock.combine_ist(
+        trade_date, ist_clock.MARKET_OPEN.replace(hour=15, minute=15))
+
+    def on_fast_tick(now) -> None:
+        if angel is None:
+            return
+        order_engine.fast_track_live_positions(state, angel, square_off)
+
+    live_loop.run_live_session(
+        on_candle, trade_date, on_tick=on_fast_tick,
+        tick_every=config.LIVE_FAST_TRACK_INTERVAL_SECS)
     print(f"\n[live] session complete -> {workbook.name}")
 
 

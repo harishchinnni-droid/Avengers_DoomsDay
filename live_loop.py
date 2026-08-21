@@ -78,32 +78,61 @@ def next_fetch_time(now: datetime | None = None,
 
 
 def sleep_until(target: datetime, check_interval: float = 1.0,
-                should_stop: Callable[[], bool] | None = None) -> bool:
+                should_stop: Callable[[], bool] | None = None,
+                on_tick: Callable[[datetime], None] | None = None,
+                tick_every: float | None = None) -> bool:
     """
     Block until `target`. Returns True if it arrived, False if interrupted.
 
     Sleeps in short slices rather than one long sleep so Ctrl-C is responsive
     and a stop flag can be honoured. A five-minute uninterruptible sleep in a
     trading loop is how you end up unable to stop a running system.
+
+    `on_tick` (20-Aug-26, the fast SL/Target/TSL tracker): called at most
+    once every `tick_every` seconds while waiting, never after `target` has
+    actually arrived -- this is what gives the fast tracker its "pauses for
+    the candle close, then resumes" behaviour for free. The loop is single-
+    threaded and blocking, so there is no window where on_tick and the
+    candle-close cycle that follows this call could run at once; one always
+    finishes before the other starts.
     """
+    last_tick = time.monotonic()
     while True:
         now = ist_clock.now_ist()
         if now >= target:
             return True
         if should_stop is not None and should_stop():
             return False
+        if (on_tick is not None and tick_every
+                and time.monotonic() - last_tick >= tick_every):
+            last_tick = time.monotonic()
+            try:
+                on_tick(now)
+            except Exception as exc:
+                print(f"[live] fast-track tick failed: {exc}")
         time.sleep(min(check_interval, max((target - now).total_seconds(), 0.05)))
 
 
 def run_live_session(on_candle: Callable[[datetime, str], None],
                      trade_date: date | None = None,
-                     should_stop: Callable[[], bool] | None = None) -> None:
+                     should_stop: Callable[[], bool] | None = None,
+                     on_tick: Callable[[datetime], None] | None = None,
+                     tick_every: float | None = None) -> None:
     """
     Drive one trading day.
 
     on_candle(fetch_time, candle_slot) is called once per closed candle, at
     close + buffer. `candle_slot` is the OPEN time label of the candle that
     just closed -- the column it belongs in on the matrix sheets.
+
+    on_tick(now), if given, is called roughly every `tick_every` seconds
+    IN BETWEEN candle closes (20-Aug-26) -- the fast SL/Target/TSL tracker
+    for whatever real live positions are already open. It never runs
+    concurrently with on_candle: sleep_until stops calling it the instant
+    the next candle's fetch time is reached, on_candle runs to completion,
+    and only then does the next sleep_until (and its own on_tick calls)
+    begin. "Pauses for the 5-min close, then resumes" is just what that
+    ordering already does -- no lock or thread needed.
 
     Cycles that overrun their slot are reported and skipped rather than
     queued. Running a stale cycle late is worse than missing it: it acts on
@@ -129,7 +158,8 @@ def run_live_session(on_candle: Callable[[datetime, str], None],
             continue  # started mid-session; this candle is long gone
 
         if now < fetch_at:
-            if not sleep_until(fetch_at, should_stop=should_stop):
+            if not sleep_until(fetch_at, should_stop=should_stop,
+                              on_tick=on_tick, tick_every=tick_every):
                 print("[live] stop requested")
                 return
 

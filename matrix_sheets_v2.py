@@ -38,6 +38,7 @@ from config import SIGNAL_BUY_CE, SIGNAL_BUY_PE, SIGNAL_WAIT
 from matrix_sheets import (
     build_matrix,
     final_recommendation,
+    macd_recommendation,
 )
 
 
@@ -60,34 +61,9 @@ def rsi_midline_recommendation(rsi_series: pd.Series) -> pd.Series:
     return out.where(rsi_series.notna(), "")
 
 
-def macd_recommendation(macd_line: pd.Series, signal_line: pd.Series,
-                        hist: pd.Series) -> pd.Series:
-    """
-    MACD confluence rule, upgraded 15-Aug-26 (Harish) to also read the
-    histogram, not just the line-vs-signal state:
-
-        BUY CE: MACD line (blue) above Signal line (orange) AND histogram
-                is bright green -- hist >= 0 AND rising, matching the
-                script's own #26a69a ("teal") colour state.
-        BUY PE: mirror -- MACD below Signal AND histogram bright red
-                (hist < 0 AND falling, the script's #ff5252 "red" state).
-        else:   WAIT
-
-    Mathematically hist >= 0 is IDENTICAL to macd_line >= signal_line
-    (hist = macd - signal), so the histogram term only adds information
-    through its RISING/FALLING half -- a positive-but-fading histogram
-    ("pale_teal", #b2dfdb in the script) does NOT confirm a CE, and a
-    negative-but-fading one ("pale_red", #ffcdd2) does NOT confirm a PE.
-    That fading half is genuinely new information: momentum has to be
-    building, not just be on the right side of zero. See
-    macd.histogram_color() for the 4-way colour state this reads.
-    """
-    colors = macd_mod.histogram_color(hist)
-    out = pd.Series(SIGNAL_WAIT, index=macd_line.index, dtype=object)
-    out[(macd_line > signal_line) & (colors == "teal")] = SIGNAL_BUY_CE
-    out[(macd_line < signal_line) & (colors == "red")] = SIGNAL_BUY_PE
-    valid = macd_line.notna() & signal_line.notna() & hist.notna()
-    return out.where(valid, "")
+# macd_recommendation() moved to matrix_sheets.py (20-Aug-26) when MACD was
+# added to the main pipeline's confluence too -- imported above, not
+# redefined, so both pipelines apply the exact same rule.
 
 
 def compute_symbol_frames_v2(candles: dict[str, pd.DataFrame],

@@ -30,6 +30,7 @@ import pandas as pd
 import config
 import ist_clock
 import indicators
+import macd as macd_mod
 from config import SIGNAL_BUY_CE, SIGNAL_BUY_PE, SIGNAL_WAIT
 
 IDX_COLS = ["Symbol", "Metrics"]
@@ -123,6 +124,35 @@ def ema_vwap_recommendation(close: pd.Series, ema: pd.Series,
     out[(close > ema) & (close > vwap)] = SIGNAL_BUY_CE
     out[(close < ema) & (close < vwap)] = SIGNAL_BUY_PE
     valid = close.notna() & ema.notna() & vwap.notna()
+    return out.where(valid, "")
+
+
+def macd_recommendation(macd_line: pd.Series, signal_line: pd.Series,
+                        hist: pd.Series) -> pd.Series:
+    """
+    MACD confluence rule (added to the main pipeline 20-Aug-26, Harish:
+    "enable MACD indicator for confluence"). Same rule matrix_sheets_v2.py
+    already uses for run_MACD.py's RSI+MACD pipeline -- canonical
+    definition lives here now, v2 imports it instead of duplicating.
+
+        BUY CE: MACD line (blue) above Signal line (orange) AND histogram
+                is bright green -- hist >= 0 AND rising, matching the
+                script's own #26a69a ("teal") colour state.
+        BUY PE: mirror -- MACD below Signal AND histogram bright red
+                (hist < 0 AND falling, the script's #ff5252 "red" state).
+        else:   WAIT
+
+    Mathematically hist >= 0 is IDENTICAL to macd_line >= signal_line
+    (hist = macd - signal), so the histogram term only adds information
+    through its RISING/FALLING half -- a positive-but-fading histogram
+    ("pale_teal") does NOT confirm a CE, a negative-but-fading one
+    ("pale_red") does NOT confirm a PE. See macd.histogram_color().
+    """
+    colors = macd_mod.histogram_color(hist)
+    out = pd.Series(SIGNAL_WAIT, index=macd_line.index, dtype=object)
+    out[(macd_line > signal_line) & (colors == "teal")] = SIGNAL_BUY_CE
+    out[(macd_line < signal_line) & (colors == "red")] = SIGNAL_BUY_PE
+    valid = macd_line.notna() & signal_line.notna() & hist.notna()
     return out.where(valid, "")
 
 
@@ -223,12 +253,14 @@ def compute_symbol_frames(candles: dict[str, pd.DataFrame],
 
     Returns {symbol: DataFrame} with columns:
         Close, RSI, RSI EMA9, DI+, DI-, ADX, N-Line, MHULL, SHULL, TREND,
-        EMA20, VWAP, ATR, TW ALL Recomm, RSI Recomm, ADX Recomm, Final Recomm
+        EMA20, VWAP, ATR, MACD, Signal, Hist, TW ALL Recomm, RSI Recomm,
+        ADX Recomm, MACD Recomm, Final Recomm
 
-    EMA20-VWAP Recomm removed from confluence (16-Aug-26) -- Final Recomm
-    is back to the 3-way TW ALL / RSI / ADX vote. EMA20/VWAP columns are
-    still computed (indicators.compute_all is shared with the other
-    pipelines) but nothing here reads them into a signal any more.
+    EMA20-VWAP Recomm removed from confluence (16-Aug-26). MACD Recomm
+    added (20-Aug-26) -- Final Recomm is now a 4-way TW ALL / RSI / ADX /
+    MACD vote. EMA20/VWAP columns are still computed (indicators.compute_all
+    is shared with the other pipelines) but nothing here reads them into a
+    signal.
 
     Warm-up bars are blanked rather than published. An ema(100) computed from
     30 bars is not an ema(100), and printing it as one invites a trade on a
@@ -246,6 +278,18 @@ def compute_symbol_frames(candles: dict[str, pd.DataFrame],
 
         ind = indicators.compute_all(df).copy()
 
+        macd_df = macd_mod.macd(
+            df["close"].astype(float),
+            fast_length=config.MACD_FAST_LENGTH,
+            slow_length=config.MACD_SLOW_LENGTH,
+            signal_length=config.MACD_SIGNAL_LENGTH,
+            osc_ma_type=config.MACD_OSC_MA_TYPE,
+            signal_ma_type=config.MACD_SIGNAL_MA_TYPE,
+        )
+        ind["MACD"] = macd_df["macd"]
+        ind["Signal"] = macd_df["signal"]
+        ind["Hist"] = macd_df["hist"]
+
         # Blank the warm-up region BEFORE deriving signals, so no signal can
         # be produced from an indicator value that hasn't settled yet.
         if warmup_bars:
@@ -255,8 +299,11 @@ def compute_symbol_frames(candles: dict[str, pd.DataFrame],
         ind["RSI Recomm"] = rsi_recommendation(
             ind["RSI"], rules, ind.get("RSI EMA9"))
         ind["ADX Recomm"] = adx_recommendation(ind[["DI+", "DI-", "ADX"]], rules)
+        ind["MACD Recomm"] = macd_recommendation(
+            ind["MACD"], ind["Signal"], ind["Hist"])
         ind["Final Recomm"] = final_recommendation(
-            [ind["TW ALL Recomm"], ind["RSI Recomm"], ind["ADX Recomm"]], rules
+            [ind["TW ALL Recomm"], ind["RSI Recomm"], ind["ADX Recomm"],
+             ind["MACD Recomm"]], rules
         )
         out[symbol] = ind
 
