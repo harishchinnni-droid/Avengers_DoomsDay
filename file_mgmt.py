@@ -121,6 +121,28 @@ def list_sheets(workbook: Path) -> list[str]:
     return pd.ExcelFile(workbook).sheet_names
 
 
+def sheet_has_rows(workbook: Path, sheet_name: str) -> bool:
+    """
+    True if `sheet_name` exists and already has at least one data row.
+
+    Added 24-Aug-26 (Harish -- restart duplicate-order bug). Orders/
+    Rejected/etc. were being reset to an empty skeleton on EVERY call to
+    setup_live_day(), not just the pre-market one -- a mid-day restart
+    (power fluctuation) called it again, wiped the morning's already-
+    written Orders/Rejected rows off disk, and the live loop then had no
+    record left that those signals had already been decided. Guard any
+    "write an empty skeleton" call with this first, so it only ever fires
+    on the genuine first run of the day.
+    """
+    if not workbook.exists():
+        return False
+    try:
+        df = pd.read_excel(workbook, sheet_name=sheet_name)
+    except (ValueError, KeyError):
+        return False
+    return len(df) > 0
+
+
 if __name__ == "__main__":
     import ist_clock
 

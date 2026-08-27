@@ -122,8 +122,12 @@ REQUEST_TIMEOUT_SECS = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECS = 2.0
 
-# Angel scrip master is large; refresh weekly rather than every run.
-SCRIP_MASTER_MAX_AGE_DAYS = 7
+# Angel scrip master refresh -- CHANGED 24-Aug-26 at Harish's request, from a
+# rolling 7-day age window to a plain calendar-day check (see
+# angel_scrip.download_scrip_master / _cached_date): the first run of a new
+# day downloads fresh, every later run that same day reuses it untouched.
+# SCRIP_MASTER_MAX_AGE_DAYS is no longer read anywhere -- removed rather than
+# left as a dead value that looks like it still does something.
 
 # --------------------------------------------------------------------------
 # INDICATOR SETTINGS  -- values taken from Harish's Pine scripts
@@ -723,6 +727,22 @@ class SignalRules:
 
 
 RULES = SignalRules()
+
+# RELAXED CONFLUENCE -- RSI/ADX one-bar grace (24-Aug-26, Harish, KOTAKBANK
+# 20-Aug-26 example: TW ALL, MACD, and RSI already agreed BUY CE, only ADX
+# was still WAIT at 09:30 -- ADX caught up at 09:35 and the 2-bar
+# qualification only started counting from there, costing a full candle of
+# entry lag). TW ALL and MACD stay mandatory on every bar; RSI and/or ADX
+# may be WAIT on the first bar of a run, and get credited retroactively if
+# the VERY NEXT bar shows full 4-way agreement -- see
+# matrix_sheets.relax_confluence_lag for the exact rule and why an ACTIVE
+# opposite vote from RSI/ADX is never bridged, only WAIT/blank.
+#
+# UNTESTED as a live rule. Compare against RELAXED_CONFLUENCE_ENABLED=False
+# on the same backtest days before trusting the earlier entries with real
+# capital -- everything else in this file that got tuned off a single
+# example and never re-validated against 30+ trades is the cautionary tale.
+RELAXED_CONFLUENCE_ENABLED = False
 
 # --------------------------------------------------------------------------
 # MATRIX SHEETS

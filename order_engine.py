@@ -365,10 +365,26 @@ def _evaluate_live_tick(angel, pos: Position, when: datetime, ltp: float,
         if pos.target_hit[i] or ltp < target - order_sheet.PRICE_EPS:
             continue
         pos.target_hit[i] = True
+        # Breakeven activation keyed on PRICE reaching T1, not on a partial
+        # exit succeeding (24-Aug-26, Harish, HDFCLIFE follow-up -- the
+        # AB4014 lot-size bug meant T1's sell order routinely never fired
+        # for a 1-lot position, which silently meant breakeven never
+        # activated either, and the trade kept riding the full original
+        # stop distance all the way to T3/SL even after price had already
+        # reached T1). Moved above the exit attempt so it fires the moment
+        # T1's price is touched, independent of whether anything actually
+        # gets sold here -- the post-loop block below reads
+        # pos.effective_stop (which reacts to breakeven_active immediately,
+        # see Position.effective_stop) and moves the resting broker stop to
+        # match on its own, same as it already does for a real trailing-
+        # stop ratchet.
+        if i == 0 and config.MOVE_SL_TO_BREAKEVEN_AT_T1:
+            pos.breakeven_active = True
         is_final_target = (i == len(pos.targets) - 1)
         qty = (pos.remaining_qty if is_final_target else
-              min(int(pos.quantity * config.TARGET_EXIT_FRACTIONS[i]),
-                  pos.remaining_qty))
+              order_sheet.target_exit_qty(
+                  pos.quantity, pos.lot_size,
+                  config.TARGET_EXIT_FRACTIONS[i], pos.remaining_qty))
         if qty <= 0:
             continue
         try:
@@ -380,8 +396,6 @@ def _evaluate_live_tick(angel, pos: Position, when: datetime, ltp: float,
             continue
         if pos.closed:
             return
-        if i == 0 and config.MOVE_SL_TO_BREAKEVEN_AT_T1:
-            pos.breakeven_active = True
         if pos.broker_stop_order_id:
             try:
                 pos.broker_stop_order_id = live_orders.resize_protective_stop(
@@ -1470,7 +1484,199 @@ def new_live_state() -> dict:
         # follow-through"). See _candle_momentum_checkpoint_signal.
         "candle_momentum_pending": {},
         "candle_momentum_checked": set(),
+        # Raw Orders-sheet rows (dicts, already shaped to ORDER_COLUMNS) for
+        # trades that resolved -- or were still open in PAPER mode -- BEFORE
+        # a restart. See rehydrate_live_state: these bypass Position/
+        # build_orders_sheet entirely and get concatenated onto orders_df
+        # as-is, because reconstructing a resolved trade's exact Gross/Net
+        # P&L would require its full partial-exit history, which nothing
+        # persists. Only a currently-OPEN LIVE position gets a real Position
+        # rebuilt (into state["live_positions"]) -- that one still needs to
+        # keep managing a real stop.
+        "resumed_orders_rows": [],
     }
+
+
+def _cell(row, col):
+    """One Excel cell, or None for missing/blank/NaN -- pandas leaves an
+    empty cell as NaN, which is truthy in Python (`bool(float('nan'))` is
+    True), so `row.get(col) or default` silently prefers the NaN over the
+    default. Every rehydration read below goes through this instead."""
+    v = row.get(col)
+    if v is None:
+        return None
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    if isinstance(v, str) and v.strip() == "":
+        return None
+    return v
+
+
+def rehydrate_live_state(state: dict, workbook, trade_date: date) -> None:
+    """
+    Restore `state` from whatever this workbook's Orders/Rejected sheets
+    already hold for `trade_date`, so a process restart (crash, power
+    fluctuation) picks up where it left off instead of re-deciding -- and
+    for LIVE, re-ENTERING -- every signal that already fired earlier today.
+
+    THE BUG THIS FIXES, live 24-Aug-26 (Harish): a restart called
+    new_live_state() fresh, state["seen"] came back empty, and
+    advance_live_day() treated every signal since 09:15 as brand new --
+    including ones that had already cleared every gate and been sent to
+    Angel One as a REAL order. This is only half the fix: setup_live_day()
+    also used to wipe the Orders/Rejected sheets back to empty on every
+    call, including a restart's -- see file_mgmt.sheet_has_rows, which
+    stops that half. Without both, this function would have nothing left
+    on disk to read back.
+
+    Call once, right after new_live_state(), before the candle loop starts.
+    On a genuine pre-market first run the sheets are empty and this is a
+    no-op. Silent about individual PAPER positions (they replay fresh from
+    scratch every cycle regardless, same as always) -- loud about anything
+    involving real capital: every LIVE position it resumes, and every one
+    it COULDN'T safely resume, is printed so it gets checked by hand rather
+    than assumed correct.
+    """
+    try:
+        rejected_df = pd.read_excel(workbook, sheet_name="Rejected")
+    except (ValueError, KeyError):
+        rejected_df = pd.DataFrame()
+    try:
+        orders_df = pd.read_excel(workbook, sheet_name="Orders")
+    except (ValueError, KeyError):
+        orders_df = pd.DataFrame()
+
+    if rejected_df.empty and orders_df.empty:
+        return  # genuine first run of the day -- nothing to recover
+
+    for _, row in rejected_df.iterrows():
+        symbol, slot = _cell(row, "Symbol"), _cell(row, "Trigger Time")
+        if not symbol or not slot:
+            continue
+        state["seen"].add((str(symbol).strip(), str(slot).strip()))
+        # advance_live_day builds rejected_df fresh from state["rejections"]
+        # every single cycle (order_sheet.build_rejected_sheet(state[
+        # "rejections"])) -- restoring `seen` alone stops NEW duplicate
+        # rejections from being generated, but the OLD rows still vanish
+        # from the sheet the moment the next cycle writes, because nothing
+        # in memory represents them any more. Re-seed the list itself, not
+        # just the dedupe set.
+        state["rejections"].append({col: row.get(col) for col in order_sheet.REJECTED_COLUMNS})
+
+    resumed_live = 0
+    resumed_history = 0
+    for _, row in orders_df.iterrows():
+        symbol = _cell(row, "Symbol")
+        entry_slot = _cell(row, "Entry Trigger Time")
+        if not symbol or not entry_slot:
+            continue
+        symbol, entry_slot = str(symbol).strip(), str(entry_slot).strip()
+        state["seen"].add((symbol, entry_slot))
+        state["entries_taken"] += 1
+
+        is_open = _cell(row, "Exit Time") is None
+        trade_mode = str(_cell(row, "Trade Mode") or "")
+        if is_open:
+            state["open_symbols"].add(symbol)
+
+        if trade_mode != "LIVE" or not is_open:
+            # advance_live_day assembles orders_df from state["terminal"] +
+            # state["live_terminal"] + whatever's still open (see the
+            # "real_positions = ..." line near the end of this function) --
+            # a resolved trade that isn't in one of those lists is simply
+            # gone from the NEXT write, same failure shape as the
+            # rejections above. Reconstructing a resolved Position well
+            # enough to reproduce its exact Gross/Net P&L would need its
+            # full partial-exit history, which nothing persists -- so carry
+            # the raw row forward as-is instead and concatenate it back
+            # onto orders_df untouched (see the end of advance_live_day).
+            # A still-open PAPER position lands here too: it has no real
+            # money on the line, but nothing resumes walking it forward
+            # after this -- it will sit frozen at its last-known state
+            # rather than disappearing, which is the best available
+            # trade-off without rebuilding its full entry-snapshot shape.
+            state["resumed_orders_rows"].append(
+                {col: row.get(col) for col in order_sheet.ORDER_COLUMNS})
+            resumed_history += 1
+            if trade_mode == "PAPER" and is_open:
+                print(f"[live-orders] NOTE: {symbol} ({entry_slot}) is an open "
+                      f"PAPER position from before the restart -- kept in the "
+                      f"sheet as-is, but its exit ladder will not resume "
+                      f"walking (no real capital at risk).")
+            continue
+
+        broker_stop_id = _cell(row, "Broker Stop Order ID")
+        broker_stop_trigger = _cell(row, "Broker Stop Trigger")
+        if broker_stop_id is None or broker_stop_trigger is None:
+            print(f"[live-orders] RESTART WARNING: {symbol} ({entry_slot}) shows "
+                  f"an open LIVE position with no recorded protective-stop "
+                  f"order -- exit management cannot resume automatically for "
+                  f"it. CHECK THE ANGEL ONE APP BY HAND.")
+            continue
+
+        try:
+            entry_time_str = _cell(row, "Entry Time")
+            entry_time = ist_clock.combine_ist(
+                trade_date, datetime.strptime(str(entry_time_str), "%H:%M:%S").time())
+            expiry_days = int(_cell(row, "Days To Expiry") or 0)
+            contract = option_chain.OptionContract(
+                symbol=symbol,
+                trading_symbol=str(_cell(row, "Option Symbol")),
+                token=str(_cell(row, "Option Token")),
+                strike=float(_cell(row, "ATM Strike")),
+                option_type="CE" if "CE" in str(_cell(row, "Signal")) else "PE",
+                expiry=trade_date + timedelta(days=expiry_days),
+                lot_size=int(_cell(row, "Lot Size")),
+            )
+            pos = Position(
+                symbol=symbol, signal=str(_cell(row, "Signal")), contract=contract,
+                entry_time=entry_time, entry_ltp=float(_cell(row, "Entry LTP")),
+                quantity=int(_cell(row, "Quantity (Units)")),
+                lots=int(_cell(row, "Quantity (Lots)")),
+                lot_size=int(_cell(row, "Lot Size")),
+            )
+            # __post_init__ just recomputed stop_loss/targets off a flat
+            # fallback (no ATR on hand here to reproduce the original ATR
+            # stop) -- overwrite with what was ACTUALLY quoted/resting at
+            # entry, never the recompute.
+            pos.stop_loss = float(_cell(row, "Stop Loss LTP"))
+            pos.targets = tuple(float(_cell(row, f"Target {i} LTP")) for i in (1, 2, 3))
+            pos.target_hit = [_cell(row, f"T{i} Hit") == "YES" for i in (1, 2, 3)]
+            pos.remaining_qty = int(_cell(row, "Remaining Qty") or pos.quantity)
+            pos.peak_ltp = float(_cell(row, "Max LTP") or pos.entry_ltp)
+            pos.trough_ltp = float(_cell(row, "Min LTP") or pos.entry_ltp)
+            pos.breakeven_active = _cell(row, "Breakeven Active") == "YES"
+            pos.tsl_breach_streak = int(_cell(row, "TSL Breach Streak") or 0)
+            pos.trade_mode = "LIVE"
+            pos.broker_entry_order_id = str(_cell(row, "Broker Order ID") or "")
+            pos.broker_stop_order_id = str(broker_stop_id)
+            pos.broker_stop_trigger = float(broker_stop_trigger)
+            pos.actual_fill_price = float(_cell(row, "Actual Fill Price") or 0.0)
+            pos.order_id = str(_cell(row, "Order ID") or "")
+            pos.trigger_slots = [s for s in (
+                _cell(row, "Pre-Entry Trigger Time"), entry_slot,
+                _cell(row, "Support Entry Time")) if s]
+
+            state["live_positions"][(symbol, entry_slot)] = pos
+            state["open_symbols"].add(symbol)
+            resumed_live += 1
+            print(f"[live-orders] RESUMED {symbol} (entry {entry_slot}): "
+                  f"{pos.remaining_qty} unit(s) open, stop order "
+                  f"{pos.broker_stop_order_id} resting at "
+                  f"{pos.broker_stop_trigger} -- verify against the Angel "
+                  f"One app before trusting this.")
+        except Exception as exc:
+            print(f"[live-orders] RESTART WARNING: could not rebuild the open "
+                  f"LIVE position for {symbol} ({entry_slot}): {exc} -- exit "
+                  f"management cannot resume automatically for it. CHECK THE "
+                  f"ANGEL ONE APP BY HAND.")
+
+    print(f"[live-orders] restart recovery: {len(state['seen'])} signal(s) "
+          f"already decided today will not be re-evaluated, {resumed_live} "
+          f"open LIVE position(s) resumed for exit management, "
+          f"{resumed_history} resolved/frozen row(s) and "
+          f"{len(state['rejections'])} rejection(s) carried forward into "
+          f"the next sheet write.")
 
 
 def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
@@ -2300,6 +2506,14 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
                 + [c for _, c in open_rows] + [c for _, c in live_open_rows])
 
     orders_df = order_sheet.build_orders_sheet(real_positions, real_ltps)
+    if state.get("resumed_orders_rows"):
+        # Rows carried forward from before a restart (see
+        # rehydrate_live_state) -- raw, never round-tripped through
+        # Position, prepended so today's history still reads top-to-bottom
+        # by when it actually happened.
+        resumed_df = pd.DataFrame(state["resumed_orders_rows"],
+                                  columns=order_sheet.ORDER_COLUMNS)
+        orders_df = pd.concat([resumed_df, orders_df], ignore_index=True)
     rejected_df = order_sheet.build_rejected_sheet(state["rejections"])
 
     shadow_positions = state["shadow_terminal"] + [p for p, _ in shadow_open_rows]

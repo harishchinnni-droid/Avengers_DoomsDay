@@ -338,6 +338,43 @@ def note_bar_range(pos: Position, bar_high: float, bar_low: float) -> None:
     pos.trough_ltp = min(pos.trough_ltp, bar_low)
 
 
+def target_exit_qty(quantity: int, lot_size: int, fraction: float,
+                    remaining_qty: int) -> int:
+    """
+    Quantity to sell at a non-final target, rounded DOWN to a whole number
+    of lots.
+
+    BUG FOUND LIVE 24-Aug-26, Harish -- HDFCLIFE, a 1-lot (1100-unit)
+    position: T1 tried to sell int(1100*0.50) = 550, T2 tried
+    int(1100*0.25) = 275. Angel One REJECTED both real orders, AB4014
+    "Quantity is invalid. It should be in multiples of lot size." -- NSE
+    F&O simply does not allow selling a fraction of a lot, and nothing
+    here was rounding to one.
+
+    Flooring to whole lots means a position too small to split (1 lot, or
+    2 lots at the 25% targets) correctly resolves to 0 here -- the caller's
+    existing `if qty > 0` skips it, and the position rides untouched to the
+    next target. The FINAL target never uses this function -- it always
+    exits pos.remaining_qty directly, which is by construction already a
+    lot multiple, so the position still exits cleanly, just later than a
+    bigger position's staged 50/25/25 would have. A too-small trade goes
+    all-or-nothing at whichever level fires first, same as a manual 1-lot
+    F&O ticket always has to.
+
+    Shared by order_engine._evaluate_live_tick (real orders) and
+    update_position below (paper/backtest simulation) so the two can never
+    quietly diverge on what a "valid" partial exit is -- before this fix,
+    the backtest was silently booking partial profits at T1/T2 that a real
+    1-lot position could never actually place, which means historical
+    profit-factor numbers for small positions overstate what live could
+    have done.
+    """
+    if lot_size <= 0:
+        return 0
+    lots = int((quantity * fraction) // lot_size)
+    return min(lots * lot_size, remaining_qty)
+
+
 def update_position(pos: Position, ltp: float, now: datetime,
                     square_off_time: datetime,
                     bar_open: float | None = None) -> list[dict]:
@@ -432,8 +469,8 @@ def update_position(pos: Position, ltp: float, now: datetime,
             fired.append(_close(pos, ltp, now, f"Target {i + 1} Hit"))
             return fired
 
-        qty = int(pos.quantity * config.TARGET_EXIT_FRACTIONS[i])
-        qty = min(qty, pos.remaining_qty)
+        qty = target_exit_qty(pos.quantity, pos.lot_size,
+                              config.TARGET_EXIT_FRACTIONS[i], pos.remaining_qty)
         if qty > 0:
             fired.append(_partial(pos, ltp, now, qty, f"Target {i + 1} Hit"))
 
@@ -573,6 +610,14 @@ ORDER_COLUMNS = [
     "Effective Stop", "Gross P/L (Rs)", "Costs (Rs)", "Net P/L (Rs)",
     "Order ID", "Exit Time", "Exit Reason", "Trade Mode",
     "Broker Order ID", "Actual Fill Price", "Actual Exit Price", "Exit Order ID",
+    # Added 24-Aug-26 (Harish -- restart duplicate-order bug). Nothing before
+    # this persisted enough to safely RESUME a still-open LIVE position after
+    # a process restart: the resting protective stop's own order id/trigger
+    # existed only in memory, and remaining_qty (vs the original quantity)
+    # wasn't written anywhere. See order_engine.rehydrate_live_state, which
+    # reads these back to reconstruct an open live Position without ever
+    # placing a fresh entry order for a signal already acted on today.
+    "Remaining Qty", "Broker Stop Order ID", "Broker Stop Trigger",
 ]
 
 REJECTED_COLUMNS = ["Symbol", "Trigger Time", "Signal", "Reason", "Timestamp"]
@@ -644,6 +689,10 @@ def position_to_row(pos: Position, current_ltp: float | None = None) -> dict:
         "Actual Exit Price": (round(pos.actual_exit_price, 2)
                               if pos.actual_exit_price else ""),
         "Exit Order ID": pos.broker_exit_order_id,
+        "Remaining Qty": pos.remaining_qty,
+        "Broker Stop Order ID": pos.broker_stop_order_id,
+        "Broker Stop Trigger": (round(pos.broker_stop_trigger, 2)
+                                if pos.broker_stop_trigger else ""),
     }
 
 

@@ -309,11 +309,29 @@ def setup_live_day(trade_date: date, kite, angel):
     print("[live-setup] writing skeleton sheets (no candles yet)")
     symbols = df_ref[config.COL_SYMBOL].astype(str).tolist()
     _write_skeleton_matrix_sheets(workbook, symbols, trade_date)
-    file_mgmt.write_sheet(workbook, "Orders", order_sheet.build_orders_sheet([]))
-    file_mgmt.write_sheet(workbook, "Rejected", order_sheet.build_rejected_sheet([]))
-    file_mgmt.write_sheet(workbook, "Missed_Concurrent", order_sheet.build_orders_sheet([]))
-    file_mgmt.write_sheet(workbook, "Capital Shadow", order_sheet.build_orders_sheet([]))
-    file_mgmt.write_sheet(workbook, "OI Blocked", order_sheet.build_orders_sheet([]))
+    # RESTART SAFETY (24-Aug-26, Harish -- power fluctuation mid-session,
+    # code re-placed real orders for every signal that had already fired
+    # that morning). setup_live_day() runs on EVERY run_live_day() call,
+    # not just the pre-market one -- a mid-day restart calls it again, and
+    # these five sheets used to get overwritten with an empty skeleton
+    # unconditionally every time, silently erasing the morning's already-
+    # decided Orders/Rejected rows off disk. Only write the empty skeleton
+    # on a sheet that doesn't already have real rows -- the genuine first
+    # run of the day. A restart now finds its own history still on disk,
+    # which order_engine.rehydrate_live_state() reads back before the loop
+    # decides anything new.
+    for sheet_name, empty_df in (
+        ("Orders", order_sheet.build_orders_sheet([])),
+        ("Rejected", order_sheet.build_rejected_sheet([])),
+        ("Missed_Concurrent", order_sheet.build_orders_sheet([])),
+        ("Capital Shadow", order_sheet.build_orders_sheet([])),
+        ("OI Blocked", order_sheet.build_orders_sheet([])),
+    ):
+        if file_mgmt.sheet_has_rows(workbook, sheet_name):
+            print(f"[live-setup] {sheet_name!r} already has rows -- "
+                  f"restart detected, leaving it alone")
+        else:
+            file_mgmt.write_sheet(workbook, sheet_name, empty_df)
 
     excel_format.format_workbook(workbook)
 
@@ -360,6 +378,7 @@ def run_live_day(trade_date: date, kite, angel) -> None:
         trade_date, config.INTERVAL_MINUTES,
         pd.Timestamp(config.MATRIX_LAST_SLOT).time())
     state = order_engine.new_live_state()
+    order_engine.rehydrate_live_state(state, workbook, trade_date)
 
     def on_candle(fetch_time, slot: str) -> None:
         _banner(7, f"{slot} candle closed -> updating")

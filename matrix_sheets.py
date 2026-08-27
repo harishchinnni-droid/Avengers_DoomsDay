@@ -185,6 +185,69 @@ def final_recommendation(components: list[pd.Series],
     return out.mask(incomplete, "")
 
 
+def relax_confluence_lag(final: pd.Series, tw: pd.Series, macd: pd.Series,
+                         rsi: pd.Series, adx: pd.Series) -> pd.Series:
+    """
+    RELAXED CONFLUENCE, RSI/ADX one-bar grace (24-Aug-26, Harish -- KOTAKBANK
+    20-Aug-26 example: TW ALL and MACD already agreed BUY CE, RSI had agreed
+    since the open, only ADX was still WAIT at 09:30 -- ADX caught up at
+    09:35 and the 2-bar qualification only started counting from there,
+    costing the trade a full candle of entry lag it didn't need).
+
+    Gated by config.RELAXED_CONFLUENCE_ENABLED -- OFF by default. `final` is
+    the ordinary 4-way "all agree" result from final_recommendation();
+    everywhere that's already an actionable signal is returned untouched.
+
+    TW ALL and MACD are treated as load-bearing: both must already show the
+    SAME signal on bar N, or nothing here applies -- this only ever bridges
+    the RSI/ADX pair, never substitutes for TW or MACD. On such a bar, if
+    RSI and/or ADX are still WAIT/blank (not yet agreeing, but not actively
+    disagreeing either) AND the VERY NEXT bar shows full 4-way agreement on
+    that same signal, bar N is credited with the signal too -- so a 2-bar
+    run can complete a bar earlier than waiting for RSI/ADX to repeat their
+    confirmation.
+
+    Never bridges an ACTIVE opposite vote from RSI or ADX (e.g. RSI reading
+    BUY PE while TW+MACD read BUY CE) -- that is a real disagreement, not a
+    component still catching up, and is left as WAIT exactly as today. Never
+    bridges across a day boundary (bar N's "next bar" must be the same
+    trade_date) -- the underlying frame is a multi-day lookback series, and
+    09:15 of the following session is not "the next candle" for 15:10 of
+    this one.
+
+    No lookahead: by the time this can act on bar N (the entry decision for
+    a run starting at N is only made once bar N+1 has CLOSED -- see
+    order_engine's "decided when the candle closes" rule), bar N+1's
+    indicator values already exist. Nothing here reads a bar before it has
+    closed.
+
+    UNTESTED as a live rule -- run it against the same backtest days as the
+    unrelaxed version and compare profit factor before trusting it with
+    real capital.
+    """
+    core = pd.Series("", index=final.index, dtype=object)
+    core[(tw == SIGNAL_BUY_CE) & (macd == SIGNAL_BUY_CE)] = SIGNAL_BUY_CE
+    core[(tw == SIGNAL_BUY_PE) & (macd == SIGNAL_BUY_PE)] = SIGNAL_BUY_PE
+
+    next_final = final.shift(-1)
+    same_day = pd.Series(final.index.date, index=final.index)
+    next_is_same_day = same_day == same_day.shift(-1)
+
+    relaxed = final.copy()
+    for signal, opposite in ((SIGNAL_BUY_CE, SIGNAL_BUY_PE),
+                             (SIGNAL_BUY_PE, SIGNAL_BUY_CE)):
+        bridge = (
+            (final == SIGNAL_WAIT)
+            & (core == signal)
+            & (rsi != opposite) & (adx != opposite)
+            & (next_final == signal)
+            & next_is_same_day
+        )
+        relaxed[bridge] = signal
+
+    return relaxed
+
+
 # --------------------------------------------------------------------------
 # matrix assembly
 # --------------------------------------------------------------------------
@@ -305,6 +368,10 @@ def compute_symbol_frames(candles: dict[str, pd.DataFrame],
             [ind["TW ALL Recomm"], ind["RSI Recomm"], ind["ADX Recomm"],
              ind["MACD Recomm"]], rules
         )
+        if config.RELAXED_CONFLUENCE_ENABLED:
+            ind["Final Recomm"] = relax_confluence_lag(
+                ind["Final Recomm"], ind["TW ALL Recomm"], ind["MACD Recomm"],
+                ind["RSI Recomm"], ind["ADX Recomm"])
         out[symbol] = ind
 
     if skipped:

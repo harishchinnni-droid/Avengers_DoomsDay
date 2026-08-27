@@ -3,8 +3,15 @@ STEP 6 — Angel One scrip master download.
 
 Angel One publishes its full instrument list as a single public JSON file, no
 authentication required. It is large (tens of MB) and changes slowly, so it
-is cached to 01_JSON_Files and only re-downloaded when older than
-SCRIP_MASTER_MAX_AGE_DAYS.
+is cached to 01_JSON_Files and re-downloaded once per CALENDAR DAY -- the
+first run of a given day fetches a fresh copy, every run after that same day
+reuses it, regardless of how many hours old it is.
+
+Changed 24-Aug-26, Harish's request -- was a rolling SCRIP_MASTER_MAX_AGE_DAYS
+(7 days) window, which could go most of a week trading Tuesday's contract
+list without the code ever noticing a new one was published. A calendar-day
+check catches new listings/expiries the same morning they appear, and still
+only downloads once no matter how many times the pipeline runs that day.
 
 This is what maps a symbol to the `symboltoken` that SmartAPI needs, and it
 is also where option contract symbols come from later.
@@ -27,22 +34,27 @@ SCRIP_MASTER_URL = (
 )
 
 
-def _age_days(path: Path) -> float:
+def _cached_date(path: Path) -> date | None:
+    """Calendar date the cached file was last written, or None if absent."""
     if not path.exists():
-        return float("inf")
-    modified = datetime.fromtimestamp(path.stat().st_mtime)
-    return (datetime.now() - modified).total_seconds() / 86400.0
+        return None
+    return datetime.fromtimestamp(path.stat().st_mtime).date()
 
 
 def download_scrip_master(force: bool = False) -> Path:
-    """Download the scrip master if the cached copy is stale. Returns its path."""
+    """
+    Download the scrip master on the first call of a new calendar day;
+    every later call the same day reuses the cached copy as-is. Returns its
+    path.
+    """
     import requests
 
     target = paths.ANGEL_SCRIP_MASTER
-    age = _age_days(target)
+    cached_date = _cached_date(target)
+    today = date.today()
 
-    if not force and age <= config.SCRIP_MASTER_MAX_AGE_DAYS:
-        print(f"[scrip] cached master is {age:.1f} day(s) old, reusing")
+    if not force and cached_date == today:
+        print(f"[scrip] cached master is from today ({cached_date}), reusing")
         return target
 
     print(f"[scrip] downloading Angel One scrip master ...")
@@ -53,7 +65,7 @@ def download_scrip_master(force: bool = False) -> Path:
     except Exception as exc:
         if target.exists():
             print(f"[scrip] download failed ({exc}); falling back to cached copy "
-                  f"which is {age:.1f} day(s) old")
+                  f"from {cached_date}")
             return target
         raise RuntimeError(f"scrip master download failed and no cache exists: {exc}")
 
