@@ -38,6 +38,64 @@ _INTERVAL_MAP = {
 }
 
 
+def _effective_cutoff(target_date: date,
+                      cutoff: datetime | None) -> datetime | None:
+    """
+    The cutoff a fetch should ACTUALLY honour, which is not always the one
+    the caller passed.
+
+    BUG FOUND 15-Sep-26 (BAJAJFINSV/AUBANK/BDL, Harish: "did not exit at
+    11:00 when there was a dot, instead it continued till EOD"). BACKTEST
+    passes cutoff=None, and both fetchers below took that to mean "any
+    cached file for this date is a complete day, return it as-is". That
+    assumption only holds for a PAST date. A backtest date can be TODAY --
+    a very normal thing to do -- and that day's cache may have been written
+    part-way through the session by the morning LIVE run. On 15-Sep-26 the
+    LIVE run cached 3-5 bars (09:15-09:35) for exactly the contracts it was
+    tracking; the evening BACKTEST then reused those stubs verbatim and
+    never fetched the remaining ~70 bars. The exit-ladder walk in
+    order_engine ran out of option candles at 09:35, so no Dot/Triangle
+    reversal after that could ever be reached, every position fell through
+    to EOD Square-off, and the P/L was marked at a stale 09:35 close.
+    Contracts the morning run had NOT touched got a clean full-day fetch --
+    which is why some of that date's cache files are ~4.9 KB (75 bars) and
+    the three traded ones were 232-361 bytes.
+
+    This is the same bug data_ingestion.download_historical_data fixed for
+    UNDERLYING candles on 14-Sep-26 (keying the cutoff off whether
+    target_date IS today, not off `mode`); it was never mirrored here,
+    which is why the Final sheet had all 75 underlying slots while the
+    option series stopped at 09:35.
+
+    A genuinely past date still returns None (no cutoff, unchanged
+    behaviour); LIVE's explicit cutoff is always returned untouched.
+    """
+    if cutoff is not None:
+        return cutoff
+    if target_date == ist_clock.today_ist():
+        return ist_clock.now_ist()
+    return None
+
+
+def _cache_is_complete(cached: pd.DataFrame, target_date: date,
+                       eff_cutoff: datetime | None,
+                       interval_td: timedelta) -> bool:
+    """
+    True when the cache already covers everything that could have closed.
+
+    With an effective cutoff (LIVE, or a same-day BACKTEST) the test is the
+    original one -- the last cached bar must close after the cutoff. For a
+    past date there is no cutoff, so the bar must reach the session close;
+    a cache stopping short of it is a stub to top up, not a full day. The
+    old code had no such test at all and returned any cache unconditionally.
+    """
+    last_close = cached.index.max() + interval_td
+    if eff_cutoff is not None:
+        return bool(last_close > eff_cutoff)
+    return bool(last_close >= ist_clock.combine_ist(target_date,
+                                                    ist_clock.MARKET_CLOSE))
+
+
 def _cache_path(token: str, interval: str, target_date: date) -> Path:
     OPT_DIR.mkdir(parents=True, exist_ok=True)
     return OPT_DIR / f"{token}_{interval}_{target_date:%Y-%m-%d}.csv"
@@ -93,6 +151,10 @@ def fetch_option_candles(token: str, target_date: date, angel,
     label = trading_symbol or token
     interval_td = timedelta(minutes=config.INTERVAL_MINUTES)
 
+    # 15-Sep-26: a BACKTEST date can be TODAY, whose cache may be a stub the
+    # morning LIVE run wrote. See _effective_cutoff's docstring.
+    cutoff = _effective_cutoff(target_date, cutoff)
+
     cached = None
     if config.REUSE_CACHE and not config.FORCE_REFRESH:
         cached = load_cached(token, interval, target_date)
@@ -100,10 +162,13 @@ def fetch_option_candles(token: str, target_date: date, angel,
             if cutoff is not None and (cached.index > cutoff).any():
                 print(f"[optdata] {label}: cache holds candles past cutoff, refetching")
                 cached = None
-            elif cutoff is None or cached.index.max() + interval_td > cutoff:
-                # BACKTEST (cutoff=None): a full-day cache is complete as-is.
-                # LIVE: nothing new has closed since the cache was written.
+            elif _cache_is_complete(cached, target_date, cutoff, interval_td):
+                # Nothing further could have closed -- the cache is current.
                 return cached
+            else:
+                print(f"[optdata] {label}: cached bars end at "
+                      f"{cached.index.max():%H:%M}, short of the session -- "
+                      f"topping up")
             # else: cache exists but is STALE relative to cutoff -- top it up.
 
     angel_interval = _INTERVAL_MAP.get(interval)
@@ -236,6 +301,10 @@ def fetch_option_history_kite(kite_api, token: int, target_date: date,
     label = trading_symbol or str(token)
     interval_td = timedelta(minutes=config.INTERVAL_MINUTES)
 
+    # 15-Sep-26: a BACKTEST date can be TODAY, whose cache may be a stub the
+    # morning LIVE run wrote. See _effective_cutoff's docstring.
+    cutoff = _effective_cutoff(target_date, cutoff)
+
     cached = None
     if config.REUSE_CACHE and not config.FORCE_REFRESH:
         cached = load_cached_kite(token, interval, target_date)
@@ -255,8 +324,13 @@ def fetch_option_history_kite(kite_api, token: int, target_date: date,
                 print(f"[optdata] {label}: cached bars predate OI capture -- "
                       f"refetching to backfill OI")
                 cached = None
-            elif cutoff is None or cached.index.max() + interval_td > cutoff:
+            elif _cache_is_complete(cached, target_date, cutoff, interval_td):
+                # Nothing further could have closed -- the cache is current.
                 return cached
+            else:
+                print(f"[optdata] {label}: Kite cached bars end at "
+                      f"{cached.index.max():%H:%M}, short of the session -- "
+                      f"topping up")
             # else: cache exists but is STALE relative to cutoff -- top it up.
 
     start = (cached.index.max() + interval_td if cached is not None and not cached.empty

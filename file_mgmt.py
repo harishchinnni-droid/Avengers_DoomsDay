@@ -5,6 +5,14 @@ STEP 4 — Copy the source watchlist into a dated working workbook.
 Each run copies it to 'DD-Mon-YY FNO-L-TW-ALL.xlsx' (LIVE) or '-BT-TW-ALL' (BACKTEST) and
 all output goes into the copy.
 
+ONE SOURCE FILE, TWO SETS (02-Sep-26, Harish). The old pair of workbooks --
+01_SourceFile_50.xlsx (48 symbols, LIVE) and 01_SourceFile_200.xlsx (206,
+BACKTEST) -- is merged into this one file with a 'Live' Yes/No column. A
+BACKTEST reads every row; a LIVE run reads only the Live=Yes rows (see
+config.LIVE_RESTRICT_TO_LIVE_ROWS) so the 5-min loop still finishes inside
+its window. Add a symbol once, mark it Yes when you're ready to trade it
+for real -- there is no second file to keep in step.
+
 Keeping the source read-only is not fussiness. Once a run starts appending
 matrix sheets to the file it also reads its watchlist from, one bad run
 corrupts the only clean copy you have.
@@ -63,11 +71,39 @@ def create_trade_file(trade_date: date, mode: str,
     return target
 
 
+def live_flags(df: pd.DataFrame) -> pd.Series:
+    """
+    Boolean 'this symbol may trade with real money' per row of a watchlist.
+
+    Reads the merged source's 'Live' column (config.COL_LIVE). If the column
+    is absent -- an older workbook, or a hand-made one -- every row counts
+    as live, which keeps existing files working exactly as before rather
+    than silently blocking every order.
+    """
+    if config.COL_LIVE not in df.columns:
+        return pd.Series(True, index=df.index)
+    return (df[config.COL_LIVE].astype(str).str.strip().str.upper()
+            == config.LIVE_MARKER_YES)
+
+
+def live_symbols(df: pd.DataFrame) -> set[str]:
+    """The Live=Yes symbols of a watchlist, upper-cased. See live_flags."""
+    flags = live_flags(df)
+    return set(df.loc[flags, config.COL_SYMBOL].astype(str).str.strip().str.upper())
+
+
 def read_reference_sheet(workbook: Path,
-                         sheet: str | None = None) -> pd.DataFrame:
+                         sheet: str | None = None,
+                         mode: str | None = None) -> pd.DataFrame:
     """
     Load the watchlist. Validates before returning, because a silently empty
     or misnamed column here produces an entire run of missing data.
+
+    mode: pass config.LIVE to get the live-tradeable subset only (the
+    Live=Yes rows of the merged source, config.LIVE_RESTRICT_TO_LIVE_ROWS).
+    Default None / BACKTEST returns every row. Deliberately explicit -- a
+    module that forgets to pass it gets the FULL list, which costs time but
+    never quietly shrinks a backtest.
     """
     sheet = sheet or config.WATCHLIST_SHEET
 
@@ -100,6 +136,26 @@ def read_reference_sheet(workbook: Path,
     df = df.reset_index(drop=True)
     print(f"[file] {sheet!r}: {len(df)} symbols loaded "
           f"({before - len(df)} row(s) dropped as blank/duplicate)")
+
+    # LIVE subset. Done AFTER validation and de-duplication so the counts
+    # printed above always describe the file as maintained, not the slice.
+    if (mode is not None and str(mode).upper() == LIVE
+            and config.LIVE_RESTRICT_TO_LIVE_ROWS):
+        if config.COL_LIVE not in df.columns:
+            print(f"[file] WARNING: no {config.COL_LIVE!r} column in {sheet!r} "
+                  f"-- running LIVE against all {len(df)} symbols. Add the "
+                  f"column and mark the ones you actually trade.")
+        else:
+            df = df[live_flags(df)].reset_index(drop=True)
+            print(f"[file] LIVE: restricted to {len(df)} symbol(s) marked "
+                  f"{config.COL_LIVE}=Yes")
+            if df.empty:
+                raise ValueError(
+                    f"no rows marked {config.COL_LIVE}=Yes in {sheet!r} of "
+                    f"{workbook.name} -- a LIVE run has nothing to watch. "
+                    f"Mark the symbols you trade, or set "
+                    f"config.LIVE_RESTRICT_TO_LIVE_ROWS = False."
+                )
     return df
 
 

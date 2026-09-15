@@ -42,7 +42,19 @@ OI_DATA_DIR: Path = BASE_DIR / "05_OI_Data"
 # as OI_DATA_DIR -- one CSV per day, easy to copy between machines.
 QUOTE_HIST_DIR: Path = BASE_DIR / "06_Quote_History"
 
+# THE watchlist, one file for both LIVE and BACKTEST (02-Sep-26). It was
+# briefly two -- 01_SourceFile_50.xlsx (48 symbols, LIVE) and
+# 01_SourceFile_200.xlsx (206, BACKTEST) -- and they are still on disk,
+# unread, as a record of where this file came from. The split now lives
+# inside the file as a 'Live' Yes/No column instead: BACKTEST runs every
+# row, LIVE runs (and orders) only the Yes rows. See config.COL_LIVE.
 SOURCE_FILE: Path = BASE_DIR / "01_SourceFile.xlsx"
+# Only used to print a better error when SOURCE_FILE is missing but the
+# pre-merge pair is sitting right there.
+LEGACY_SOURCE_FILES: tuple[Path, ...] = (
+    BASE_DIR / "01_SourceFile_50.xlsx",
+    BASE_DIR / "01_SourceFile_200.xlsx",
+)
 
 # Credential files (structure already established in 01_JSON_Files)
 ANGEL_CRED_FILE: Path = JSON_DIR / "harish_angel_one.json"
@@ -110,7 +122,14 @@ def verify_layout(require_source: bool = True) -> list[str]:
         )
 
     if require_source and not SOURCE_FILE.exists():
-        problems.append(f"source workbook not found: {SOURCE_FILE}")
+        msg = f"source workbook not found: {SOURCE_FILE}"
+        found = [p.name for p in LEGACY_SOURCE_FILES if p.exists()]
+        if found:
+            msg += (f" -- but {', '.join(found)} is here. Those two were "
+                    f"merged into one 01_SourceFile.xlsx with a 'Live' "
+                    f"Yes/No column on 02-Sep-26; the merged file is what "
+                    f"every pipeline reads now.")
+        problems.append(msg)
 
     if not JSON_DIR.exists():
         problems.append(f"credentials folder not found: {JSON_DIR}")
@@ -174,6 +193,20 @@ def dated_workbook_path_ema_pivot(trade_date, mode: str) -> Path:
     suffix = "L" if str(mode).upper() == "LIVE" else "BT"
     stamp = trade_date.strftime("%d-%b-%y")
     return BASE_DIR / f"{stamp} FNO-{suffix}-EMA-PIVOT.xlsx"
+
+
+def dated_workbook_path_harish(trade_date, mode: str) -> Path:
+    """
+    Output workbook name for run_HARISH.py (Harish TW EMA + VWAP, standalone):
+    'DD-Mon-YY FNO-L-HARISH.xlsx' for LIVE, '-BT-HARISH' for BACKTEST.
+
+    Deliberately a different suffix from every other pipeline's naming
+    function, so this can run on the same date without overwriting -- or
+    being overwritten by -- run_TW_ALL.py/run_MACD.py/run_EMA_PIVOT.py.
+    """
+    suffix = "L" if str(mode).upper() == "LIVE" else "BT"
+    stamp = trade_date.strftime("%d-%b-%y")
+    return BASE_DIR / f"{stamp} FNO-{suffix}-HARISH.xlsx"
 
 
 if __name__ == "__main__":

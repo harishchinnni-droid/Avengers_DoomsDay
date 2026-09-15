@@ -31,7 +31,8 @@ import config
 import ist_clock
 import indicators
 import macd as macd_mod
-from config import SIGNAL_BUY_CE, SIGNAL_BUY_PE, SIGNAL_WAIT
+from config import (SIGNAL_BUY_CE, SIGNAL_BUY_PE, SIGNAL_WAIT, SIGNAL_INVALID,
+                    CANDLE_BULLISH, CANDLE_BEARISH, CANDLE_DOJI)
 
 IDX_COLS = ["Symbol", "Metrics"]
 
@@ -104,10 +105,20 @@ def tw_recommendation(frame: pd.DataFrame) -> pd.Series:
     pre-entry is the Hull crossover event itself, entry bar's close beyond
     the crossover bar's close = BUY CE, mirrored for PE. Delegates to
     indicators.tw_recommendation so the logic lives in one place.
+
+    TARGET LINE CONFIRMATION (09-Sep-26, Harish: check the thin Red/Green
+    target line's colour -- Green for BUY CE, Red for BUY PE). Off by
+    default (config.TW_TARGET_LINE_CONFIRM_REQUIRED); when on, the Level1
+    Color / Level2 Color columns (see indicators.tw_target_lines) are
+    passed through as an extra required gate alongside ribbon + N-Line.
     """
+    cols = ["Close", "MHULL", "SHULL", "N-Line"]
+    if config.TW_TARGET_LINE_CONFIRM_REQUIRED:
+        cols += ["Level1 Color", "Level2 Color"]
     return indicators.tw_recommendation(
-        frame[["Close", "MHULL", "SHULL", "N-Line"]],
-        frame["Close"]
+        frame[cols],
+        frame["Close"],
+        require_target_line=config.TW_TARGET_LINE_CONFIRM_REQUIRED,
     )
 
 
@@ -248,6 +259,77 @@ def relax_confluence_lag(final: pd.Series, tw: pd.Series, macd: pd.Series,
     return relaxed
 
 
+def candle_direction(open_s: pd.Series, close_s: pd.Series) -> pd.Series:
+    """
+    Bullish / Bearish / Doji from the bar's own body: close vs open.
+
+    Added 02-Sep-26 (Harish): raw price-action fact for the Final sheet's
+    "Candle" row, feeding confirmed_recommendation() below. A doji
+    (close == open) is neither -- it gets its own label rather than being
+    silently bucketed into one side.
+    """
+    out = pd.Series(CANDLE_DOJI, index=close_s.index, dtype=object)
+    out[close_s > open_s] = CANDLE_BULLISH
+    out[close_s < open_s] = CANDLE_BEARISH
+    valid = open_s.notna() & close_s.notna()
+    return out.where(valid, "")
+
+
+def confirmed_recommendation(final: pd.Series, candle: pd.Series) -> pd.Series:
+    """
+    Next-candle confirmation filter (02-Sep-26, Harish).
+
+    Entry is only ever decided once Final Recomm has fired on TWO
+    consecutive bars (the 2-bar run order_engine qualifies on). This row
+    checks the price action of that SECOND bar: a BUY CE run whose 2nd
+    candle closed bearish is a signal the market immediately disagreed
+    with, and is marked INVALID instead of being echoed. Mirror for BUY PE.
+
+        2nd bar of a run, candle agrees      -> the signal (BUY CE/PE)
+        2nd bar of a run, candle contradicts -> INVALID (doji counts as
+                                                contradicting: "must close
+                                                Bullish" is not satisfied
+                                                by closing flat)
+        every other bar                      -> blank
+
+    Only the 2nd bar of each run is judged -- the entry decision is made at
+    that bar's close, so later bars of the same run neither confirm nor
+    re-invalidate it (Harish, 02-Sep-26). A run must sit inside one trading
+    day: 09:15 is never "the 2nd bar" of a run that started at yesterday's
+    15:10.
+
+    ENFORCED from 02-Sep-26: order_sheet.candle_confirms applies exactly
+    this rule as the FIRST gate before the Orders sheet, reading the same
+    "Candle" row this function reads. It reads that row rather than this
+    one so the two can't disagree about where a run starts -- but a row
+    showing INVALID here and a rejection on the Rejected sheet are the same
+    event, seen from the sheet and from the engine.
+
+    No lookahead: bar N's candle direction uses bar N's own open/close,
+    which exist the moment bar N closes -- the same moment the 2-bar entry
+    decision is made anyway.
+    """
+    out = pd.Series("", index=final.index, dtype=object)
+
+    same_day = pd.Series(final.index.date, index=final.index)
+    prev_same_day = same_day == same_day.shift(1)
+    prev2_same_day = same_day == same_day.shift(2)
+
+    prev, prev2 = final.shift(1), final.shift(2)
+
+    for signal, needed in ((SIGNAL_BUY_CE, CANDLE_BULLISH),
+                           (SIGNAL_BUY_PE, CANDLE_BEARISH)):
+        # bar N is the 2nd bar of a run: N and N-1 show the signal, and N-1
+        # was the run's FIRST bar (N-2 showed something else, or belongs to
+        # a different session).
+        second = ((final == signal) & (prev == signal) & prev_same_day
+                  & ((prev2 != signal) | ~prev2_same_day))
+        out[second & (candle == needed)] = signal
+        out[second & (candle != needed) & (candle != "")] = SIGNAL_INVALID
+
+    return out
+
+
 # --------------------------------------------------------------------------
 # matrix assembly
 # --------------------------------------------------------------------------
@@ -317,7 +399,7 @@ def compute_symbol_frames(candles: dict[str, pd.DataFrame],
     Returns {symbol: DataFrame} with columns:
         Close, RSI, RSI EMA9, DI+, DI-, ADX, N-Line, MHULL, SHULL, TREND,
         EMA20, VWAP, ATR, MACD, Signal, Hist, TW ALL Recomm, RSI Recomm,
-        ADX Recomm, MACD Recomm, Final Recomm
+        ADX Recomm, MACD Recomm, Final Recomm, Candle, Confirmed Recomm
 
     EMA20-VWAP Recomm removed from confluence (16-Aug-26). MACD Recomm
     added (20-Aug-26) -- Final Recomm is now a 4-way TW ALL / RSI / ADX /
@@ -372,6 +454,9 @@ def compute_symbol_frames(candles: dict[str, pd.DataFrame],
             ind["Final Recomm"] = relax_confluence_lag(
                 ind["Final Recomm"], ind["TW ALL Recomm"], ind["MACD Recomm"],
                 ind["RSI Recomm"], ind["ADX Recomm"])
+        ind["Candle"] = candle_direction(ind["Open"], ind["Close"])
+        ind["Confirmed Recomm"] = confirmed_recommendation(
+            ind["Final Recomm"], ind["Candle"])
         out[symbol] = ind
 
     if skipped:

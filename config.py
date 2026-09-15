@@ -68,8 +68,34 @@ BACKTEST = "BACKTEST"
 # WATCHLIST
 # --------------------------------------------------------------------------
 # Sheet in 01_SourceFile.xlsx that drives a run. Harish chose 'Reference'
-# (161 symbols). Alternatives present in the file: 'Nifty50', 'Reference (2)'.
+# (206 symbols). Alternatives present in the file: 'Nifty50', 'Reference (2)'.
 WATCHLIST_SHEET = "Reference"
+
+# MERGED SOURCE (02-Sep-26, Harish). There used to be two hand-maintained
+# workbooks: 01_SourceFile_50.xlsx (48 symbols, the LIVE set) and
+# 01_SourceFile_200.xlsx (206 symbols, the BACKTEST set). Keeping two files
+# in step by hand is the kind of chore that eventually ships a stale
+# watchlist into a live session, so they are now ONE file --
+# 01_SourceFile.xlsx, every symbol, plus a 'Live' Yes/No column marking the
+# ones allowed to trade with real money. The two originals are left on disk
+# untouched as a record; nothing reads them any more.
+COL_LIVE = "Live"
+LIVE_MARKER_YES = "YES"          # compared upper-cased and stripped
+
+# LIVE mode only: restrict the whole run -- candles, matrix sheets, signals
+# -- to the Live=Yes rows. This is what keeps the 5-min live loop inside its
+# window; topping up and re-computing 206 symbols every cycle is roughly
+# four times the work of 48, and the loop has to finish before the next
+# candle closes. BACKTEST always uses every row, which is the point of the
+# larger list. Set False to run the full watchlist live as well -- time one
+# cycle before trusting it.
+LIVE_RESTRICT_TO_LIVE_ROWS = True
+
+# Second, independent guard on the same column: even if the run above is
+# widened, a REAL Angel One order is only ever placed for a symbol marked
+# Live=Yes. Belt and braces on purpose -- this is the flag standing between
+# a watchlist edit and real money.
+LIVE_ORDERS_ONLY_FOR_LIVE_ROWS = True
 
 COL_SECTOR = "Sector"
 COL_SYMBOL = "Symbol / StrikePrice"
@@ -181,6 +207,22 @@ TW_NLINE_LENGTH = 100         # script: ema100 = ema(src, 100)
 #         the Python output is being compared against TradingView)
 # True  = use the standard Hull formula, which will NOT match his chart
 TW_USE_STANDARD_EHMA = False
+
+# --- TW target/stop-loss lines -- quick pivots (09-Sep-26) ---
+# script: left = 33, quick_right = 3 -- see indicators.tw_target_lines for
+# the level1/level2 translation (src_auto_sr == "Close" is hardcoded in his
+# script, not exposed as a toggle here either).
+TW_TARGET_LEFT = 33
+TW_TARGET_QUICK_RIGHT = 3
+
+# Gates TW ALL Recomm on a THIRD condition on top of ribbon + N-Line: the
+# quick target-line pair (Level1 Color / Level2 Color) must also be Green
+# for BUY CE / Red for BUY PE (Harish, 09-Sep-26: "check the color of the
+# Thin RED & Green line, which is target line"). OFF by default -- this is
+# a brand-new, untested gate; compare against False on the same backtest
+# days before trusting it with real capital, same caution as
+# RELAXED_CONFLUENCE_ENABLED below.
+TW_TARGET_LINE_CONFIRM_REQUIRED = False
 
 # TW ALL rule history, most recent first (see indicators.tw_recommendation
 # for the live version):
@@ -461,8 +503,24 @@ RISK_PER_TRADE_RS = 2000.0        # flat rupee budget, as in the sample workbook
 # multi-session backtest is re-run. The old values are kept below, commented,
 # so an A/B comparison is one edit away.
 STOP_LOSS_MULT = 0.93             # -7%   (was 0.90); fallback when ATR is absent
-TARGET_MULTS = (1.07, 1.12, 1.20) # (was 1.10, 1.20, 1.35 -- T3 never hit)
-TARGET_EXIT_FRACTIONS = (0.50, 0.25, 0.25)
+
+# TARGET LADDER, EXTENDED TO T10 (12-Sep-26, Harish: "Set Target 4, 5, 6, 7,
+# 8, 9, 10 etc and I dont want code to stop at T3 Hit alone, let it continue
+# till the exit time. If we have big movement then let it capture it and
+# turn into a profit"). Previously T3 (the LAST entry in TARGET_MULTS) forced
+# a full close -- update_position()/_evaluate_live_tick() special-cased
+# "last target index = sell everything". That's gone: every level now just
+# takes its partial (same as T1/T2 always did), for every pipeline. The
+# fractions below sum to 0.99, not 1.00, on purpose -- whatever's left after
+# T10 (usually more, since target_exit_qty floors every partial DOWN to a
+# whole lot, so smaller positions run out of sellable partials well before
+# T10 and are already riding pure runner) keeps riding under ONLY the
+# trailing stop (see TRAILING_STOP_MULT/effective_stop below) until it's
+# stopped out, hits EOD Square-off, or an opposite-signal invalidation
+# fires. There is deliberately no hard ceiling above T10 -- that IS the
+# "let it continue... if we have big movement" runner.
+TARGET_MULTS = (1.07, 1.12, 1.20, 1.28, 1.36, 1.44, 1.52, 1.60, 1.68, 1.76)
+TARGET_EXIT_FRACTIONS = (0.30, 0.20, 0.15, 0.10, 0.08, 0.06, 0.04, 0.03, 0.02, 0.01)
 
 # --- ATR-ADAPTIVE STOP (adopted from F:\06_Claude_v2, 02-Aug-26) ----------
 # A fixed percentage stop is the same distance in a sleepy stock and a wild
@@ -553,6 +611,62 @@ MAX_HOLD_MINS = 75
 # alone is normal noise; both together is what actually happened in his
 # example. See order_engine._macd_invalidated.
 MACD_INVALIDATION_EXIT_ENABLED = True
+
+# HARISH SIGNAL-INVALIDATION EXIT (added 12-Sep-26 -- ALKEM example: BUY PE
+# entered 10:30, Dot/Triangle turned Green/Green again at 11:00-11:05, and
+# the position still ran unchanged to EOD Square-off at 15:15, which Harish
+# called out: "Check the code why the order did not exit"). Root cause:
+# order_engine only ever had ONE signal-based early exit
+# (MACD_INVALIDATION_EXIT_ENABLED above), hardcoded to MACD's own "MACD
+# Recomm" column -- every other pipeline's positions (this one included)
+# only ever exited on Stop Loss, Target/Trailing SL, or EOD Square-off.
+#
+# Simpler than the MACD version: no separate underlying-candle-colour
+# cross-check is needed, because Harish Recomm is already a one-bar
+# decisive event (adjacent same-colour Dot/Triangle markers PLUS that bar's
+# own candle confirming direction -- see indicators.harish_recommendation).
+# Checked every closed candle after entry: fires the instant this closed
+# bar's Harish Recomm reads the OPPOSITE of the position's own signal.
+# See order_engine._harish_invalidated. Only read/used when a workbook
+# actually has a "Harish Recomm" row (run_HARISH.py) -- harmless no-op
+# otherwise, same defensive row-lookup pattern as the MACD check.
+HARISH_INVALIDATION_EXIT_ENABLED = True
+
+# HARISH DOT FAST-EXIT (added 12-Sep-26 -- AUROBINDOPHARMA example, same
+# report as the two below): "Look out for next green dot in BUY PE
+# situation and exit immd. Look out for next red dot in BUY CE situation
+# and exit immd." Deliberately FASTER/LOOSER than HARISH_INVALIDATION_EXIT_
+# ENABLED above -- that one needs the full Harish Recomm reversal (adjacent
+# same-colour Dot/Triangle markers + a confirming candle); this one fires
+# on a SINGLE opposite-colour Dot alone, no Triangle or candle confirmation
+# needed. Runs alongside, not instead of, the Harish Recomm reversal check
+# -- whichever fires first closes the position. See
+# order_engine._harish_dot_fast_exit, which reads the "Dot" row
+# indicators.compute_harish now exposes unmerged in the Final sheet
+# (FINAL_ROWS_HARISH) purely for this. Inherently Harish-only -- no other
+# pipeline's workbook has a "Dot" row, so this is a harmless no-op there.
+HARISH_DOT_FAST_EXIT_ENABLED = True
+
+# EARLY-CANDLE STOP TIGHTENING (added 12-Sep-26 -- AUROBINDOPHARMA BUY PE
+# entered 09:15, the very next 09:20 candle closed Bullish against the
+# trade, and it still rode the full ATR stop down to a ~Rs 2,000 loss --
+# "keep the stop loss to the previous candle so that we can exit faster
+# instead of losing 2k fully"). Applies to EVERY pipeline (TW ALL, MACD,
+# EMA-Pivot, Harish alike) -- it only needs the position's own signal and
+# the underlying's candles, no pipeline-specific indicator.
+#
+# Checked ONCE, on the first underlying candle that closes after entry. If
+# that candle closed AGAINST the position's direction (Bullish while
+# holding BUY PE, Bearish while holding BUY CE), the option stop is
+# tightened -- never loosened -- to whatever ATM-delta-equivalent premium
+# distance corresponds to the underlying's PREVIOUS candle (the entry/
+# signal candle) extreme: its high for a PE (a rise back above it breaks
+# the bearish setup), its low for a CE. Converts the underlying distance to
+# premium terms via the same ATM_DELTA_APPROX already used by
+# compute_stop_price, so it's consistent with how the normal ATR stop is
+# sized, just anchored to one specific nearby candle instead of an ATR
+# average. See order_engine._tighten_stop_after_adverse_first_candle.
+EARLY_CANDLE_TIGHTEN_ENABLED = True
 
 # --------------------------------------------------------------------------
 # OPTION AUDIT GATES
@@ -760,18 +874,63 @@ RELAXED_CONFLUENCE_ENABLED = False
 
 # Which sheets get built, and the metric rows each one carries.
 MATRIX_SHEETS: dict[str, list[str]] = {
-    "TW ALL": ["Close", "N-Line", "MHULL", "SHULL", "TREND", "TW ALL Recomm"],
+    "TW ALL": ["Close", "N-Line", "MHULL", "SHULL", "TREND",
+              "Level1", "Level2", "Level1 Color", "Level2 Color",
+              "TW ALL Recomm"],
     "RSI": ["Close", "RSI", "RSI EMA9", "RSI Recomm"],
     "ADX": ["DI+", "DI-", "ADX", "ADX Recomm"],
     "MACD": ["Close", "MACD", "Signal", "Hist", "MACD Recomm"],
 }
 
 FINAL_SHEET_NAME = "Final"
-FINAL_ROWS = ["TW ALL Recomm", "RSI Recomm", "ADX Recomm", "MACD Recomm", "Final Recomm"]
+# Candle + Confirmed Recomm added 02-Sep-26 (Harish): next-candle confirmation
+# filter. "Candle" is the bar's own body direction (close vs open). On the
+# 2nd bar of a 2-in-a-row Final Recomm run, that bar's candle must agree with
+# the signal (Bullish for BUY CE, Bearish for BUY PE) or the run is marked
+# INVALID.
+#
+# ENFORCED from 02-Sep-26 (Harish) -- see FINAL_CANDLE_CONFIRM_REQUIRED
+# below. No longer display-only.
+FINAL_ROWS = ["TW ALL Recomm", "RSI Recomm", "ADX Recomm", "MACD Recomm",
+              "Final Recomm", "Candle", "Confirmed Recomm"]
+# The component signals that vote into Final Recomm -- NOT everything in
+# FINAL_ROWS (Candle / Confirmed Recomm are derived after the vote).
+FINAL_COMPONENTS = ["TW ALL Recomm", "RSI Recomm", "ADX Recomm", "MACD Recomm"]
 
 SIGNAL_BUY_CE = "BUY CE"
 SIGNAL_BUY_PE = "BUY PE"
 SIGNAL_WAIT = "WAIT"
+SIGNAL_INVALID = "INVALID"
+
+CANDLE_BULLISH = "Bullish"
+CANDLE_BEARISH = "Bearish"
+CANDLE_DOJI = "Doji"
+
+# THE FIRST GATE (02-Sep-26, Harish: "the BUY CE or BUY PE signal should be
+# placed in order sheet only if the 2nd candle is closed Bullish for BUY CE,
+# Bearish for BUY PE. This should be checked before moving it to order
+# sheet. From here Audit check will start.")
+#
+# A qualified run is CONSECUTIVE_SIGNALS_REQUIRED bars of the same Final
+# Recomm value. This gate looks at the SECOND of those bars and asks
+# whether price itself agreed: its own body (close vs open) must point the
+# same way as the signal. It runs BEFORE every other gate -- VIX, regime,
+# volatility, RSI-extreme, candle momentum, tradeability, ranking, and the
+# whole option audit -- so a run the market immediately contradicted never
+# reaches the Orders sheet at all, and never spends an option-quote call
+# finding that out. Rejected runs still appear on the Rejected sheet with
+# the reason, so nothing disappears silently.
+#
+# A Doji (close == open) FAILS: "must close Bullish" is not satisfied by
+# closing flat. Same rule the Final sheet's Confirmed Recomm row already
+# displays -- matrix_sheets.confirmed_recommendation -- this just makes
+# order_engine obey it.
+#
+# Distinct from CANDLE_MOMENTUM_ENABLED, which compares the 2nd bar's close
+# against the 1st bar's close (did price move FORWARD). This asks a
+# simpler, earlier question: did the 2nd bar close green or red on its own.
+# A bar can gap up and still close red -- momentum passes, this does not.
+FINAL_CANDLE_CONFIRM_REQUIRED = True
 
 # --------------------------------------------------------------------------
 # PIPELINE MACD  (run_MACD.py, 13-Aug-26, Harish's request)
@@ -856,6 +1015,67 @@ MATRIX_SHEETS_EMA_PIVOT: dict[str, list[str]] = {
 FINAL_ROWS_EMA_PIVOT = ["EMA-Pivot Recomm", "Final Recomm"]
 
 # --------------------------------------------------------------------------
+# PIPELINE HARISH  (run_HARISH.py, 12-Sep-26, Harish's request)
+# --------------------------------------------------------------------------
+# Fourth pipeline, standalone: the new "Harish TW EMA + VWAP" Pine v6 script
+# converted whole. TW ALL/RSI/ADX/MACD/EMA-Pivot are all dropped -- this
+# pipeline's confluence is exactly one rule, indicators.harish_recommendation.
+#
+# SIMPLIFIED 12-Sep-26 (Harish, after reviewing real output): Dot (EMA9
+# cross) and Triangle (Hull ribbon flip) merged into one "Dot/Triangle"
+# row, and the rule is now just "both show up on adjacent bars, either
+# order, with the 2nd bar closing in the matching direction" -- the
+# original 6-gate version (Dot THEN Triangle specifically, plus ribbon/
+# N-Line/EMA9) almost never fired. See indicators.harish_recommendation's
+# docstring/revision history for the full before/after.
+#
+# Deliberately a SEPARATE file/pipeline, same reasoning as MACD/EMA-Pivot
+# above -- and explicitly NOT a change to run_TW_ALL.py, its matrix_sheets.py,
+# or config.MATRIX_SHEETS (Harish, 12-Sep-26: "I wanted a separate code, do
+# not touch run_TW_ALL.py").
+#
+# Same Hull (length 16, Ehma) and N-Line (ema100) as TW All in One -- this
+# script's own defaults for those two match exactly, so indicators.py's
+# tw_all_in_one() is reused rather than recomputed (see
+# indicators.compute_harish). The one new input is EMA9 ("orange line").
+HARISH_EMA_LENGTH = 9          # script: emaLength = 9, source = close
+
+MATRIX_SHEETS_HARISH: dict[str, list[str]] = {
+    "Harish": ["Close", "EMA9", "N-Line", "MHULL", "SHULL", "TREND",
+              "Dot/Triangle", "Harish Recomm"],
+}
+
+# Single-component confluence, same convention as EMA-Pivot above -- Final
+# Recomm trivially equals Harish Recomm. "Dot" (added 12-Sep-26, unmerged --
+# see indicators.compute_harish) rides along here purely so order_engine
+# can read it per-bar for _harish_dot_fast_exit; it isn't part of the
+# confluence and doesn't feed Final Recomm.
+FINAL_ROWS_HARISH = ["Harish Recomm", "Dot", "Final Recomm"]
+
+# Audit checks off, same starting point as MACD_AUDIT_ENABLED /
+# EMA_PIVOT_AUDIT_ENABLED -- straight from Final Recomm to the order sheet,
+# built up step by step from here. BACKTEST only (order_engine.process_date).
+HARISH_AUDIT_ENABLED = False
+
+# ORDER-ENGINE QUALIFICATION OVERRIDE (12-Sep-26, Harish: "No need to wait
+# for 2 BUY signals now"). The shared order_engine/order_sheet machinery
+# every pipeline uses (config.CONSECUTIVE_SIGNALS_REQUIRED, normally 2)
+# only qualifies a run once the SAME Final Recomm value repeats for that
+# many consecutive 5-min columns. Harish Recomm is already a one-bar
+# decisive EVENT (see harish_recommendation) -- it essentially never
+# repeats twice in a row by construction, so waiting for 2 would mean it
+# almost never qualifies for an order at all.
+#
+# run_HARISH.py's main() sets `config.CONSECUTIVE_SIGNALS_REQUIRED =
+# HARISH_CONSECUTIVE_SIGNALS_REQUIRED` at startup, in its OWN process only
+# -- run_TW_ALL.py/run_MACD.py/run_EMA_PIVOT.py each run as separate
+# python processes with their own fresh import of this module, so this
+# never touches their behaviour (config.CONSECUTIVE_SIGNALS_REQUIRED stays
+# 2 for all of them). This constant, not the shared one, is what
+# run_HARISH.py actually uses.
+HARISH_CONSECUTIVE_SIGNALS_REQUIRED = 1
+
+# --------------------------------------------------------------------------
 # AUTHENTICATION
 # --------------------------------------------------------------------------
 # How Zerodha gets a fresh access_token when the cached one is stale.
@@ -908,7 +1128,17 @@ def describe_rules() -> str:
         f"  EMA-VWAP     : close above EMA{EMA_VWAP_LENGTH} & VWAP({VWAP_SOURCE}) = CE, "
         f"below both = PE, else WAIT\n"
         f"  Confluence   : {RULES.confluence} of "
-        f"{len(FINAL_ROWS) - 1} components must agree"
+        f"{len(FINAL_COMPONENTS)} components must agree\n"
+        f"  2nd candle   : "
+        + (f"must close {CANDLE_BULLISH} for {SIGNAL_BUY_CE} / "
+           f"{CANDLE_BEARISH} for {SIGNAL_BUY_PE} (Doji fails) -- "
+           f"checked before the audit"
+           if FINAL_CANDLE_CONFIRM_REQUIRED else "not checked")
+        + f"\n  Watchlist    : one merged 01_SourceFile.xlsx; LIVE run "
+        + (f"restricted to {COL_LIVE}=Yes rows"
+           if LIVE_RESTRICT_TO_LIVE_ROWS else "uses every row")
+        + (f", real orders only for {COL_LIVE}=Yes"
+           if LIVE_ORDERS_ONLY_FOR_LIVE_ROWS else "")
     )
 
 

@@ -425,21 +425,13 @@ def write_dashboard_sheet(workbook_path, orders: pd.DataFrame,
     ws.append([None, footnote])
     ws.cell(row=ws.max_row, column=2).font = _styles.Font(italic=True, color="808080")
 
-    # ---- chart source: trade outcome + LIVE vs PAPER (15-Aug-26) ----------
-    # Small tables that exist purely to give the Win/Loss pie and the
-    # LIVE-vs-PAPER bar chart real cells to read from -- shown plainly on
-    # the sheet too, not hidden, since the breakdown is useful on its own.
-    ws.append([])
-    ws.append([None, "TRADE OUTCOME"])
-    ws.append([None, "Wins", overall.wins])
-    ws.append([None, "Losses", overall.losses])
-    ws.append([None, "Breakeven", overall.breakeven])
-
-    ws.append([])
-    ws.append([None, "LIVE VS PAPER -- NET P/L (Rs)"])
-    ws.append([None, "LIVE", round(live_stats.net, 2)])
-    ws.append([None, "PAPER", round(paper_stats.net, 2)])
-
+    # "TRADE OUTCOME" and "LIVE VS PAPER -- NET P/L" tables removed
+    # 12-Sep-26 at Harish's request ("not adding any values") -- they were
+    # leftover chart-source tables from the native Excel charts added
+    # 15-Aug-26 and removed 16-Aug-26; the charts never came back, and every
+    # number in these two tables is already shown in the KPI panels above
+    # (Profitable/Loss/Breakeven Trades in the overall panel, Total Net P/L
+    # in the separate LIVE/PAPER panels), so they were pure duplication.
     ws.append([])
     ws.append([None, "PER-SYMBOL PERFORMANCE"])
     ws.append([None, "Symbol", "Trades", "Wins", "Losses",

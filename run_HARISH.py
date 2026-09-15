@@ -1,51 +1,70 @@
 """
-ORCHESTRATOR (MACD) — same pipeline as run_TW_ALL.py, MACD in place of TW ALL.
+ORCHESTRATOR (HARISH) — same pipeline shape as run_TW_ALL.py, the new
+"Harish TW EMA + VWAP" Pine v6 script (12-Sep-26) in place of TW ALL/RSI/
+ADX/MACD.
 
-    py run_MACD.py
+    py run_HARISH.py
 
 Everything downstream of the matrix sheets (option chain, audit gates,
-order engine, dashboard, formatting) is UNCHANGED from run_TW_ALL.py --
-it only ever reads the "Final Recomm" row out of the Final sheet, and
-matrix_sheets_v2.py produces that row in the exact same shape. The only
+order engine, dashboard, formatting) is UNCHANGED from run_TW_ALL.py -- it
+only ever reads the "Final Recomm" row out of the Final sheet, and
+matrix_sheets_harish.py produces that row in the exact same shape. The only
 real difference is step 8:
 
-    original (run_TW_ALL.py)   8  matrix_sheets.py     TW ALL + RSI + ADX + EMA VWAP -> Final
-    this file (run_MACD.py)    8  matrix_sheets_v2.py  RSI + ADX + EMA VWAP + MACD  -> Final
+    original (run_TW_ALL.py)  8  matrix_sheets.py        TW ALL + RSI + ADX + MACD -> Final
+    this file (run_HARISH.py) 8  matrix_sheets_harish.py  Harish TW EMA + VWAP      -> Final
+                                                          (one rule, see
+                                                          indicators.harish_recommendation)
 
 WHY A SEPARATE FILE INSTEAD OF EDITING run_TW_ALL.py
 --------------------------------------------------------
-run_TW_ALL.py is the verified, working pipeline. Swapping its confluence
-set in place would mean there is no way to compare the two side by side, or
-fall back to the original if MACD turns out worse. This file is a full copy
-with one step's import changed, plus its own output filenames (see below)
-so the two pipelines can be run on the same date without either overwriting
-the other's workbook.
+Same reasoning as run_MACD.py/run_EMA_PIVOT.py before it, and explicit per
+Harish (12-Sep-26): "I wanted a separate code, do not touch run_TW_ALL.py."
+run_TW_ALL.py, its matrix_sheets.py, and config.MATRIX_SHEETS/FINAL_ROWS are
+untouched by this file -- indicators.py gained two new standalone functions
+(compute_harish, harish_recommendation) alongside compute_all()/
+tw_recommendation(), not changes to them, and config.py gained its own
+MATRIX_SHEETS_HARISH/FINAL_ROWS_HARISH block alongside (not inside) the
+original MATRIX_SHEETS/FINAL_ROWS. This file is a full copy of run_MACD.py's
+shape with step 8 swapped and its own output filenames (see below), so all
+four pipelines can run on the same date without any one overwriting another.
+
+THE RULE (Harish's own description, 12-Sep-26)
+--------------------------------------------------------
+"If a candle is closed with Green Dot and immediate next candle should have
+Green Triangle and candle should be Bullish and candle should be above the
+Blue Ribbon & N-Line (purple line), and touching or above Orange Line. Then,
+it should be BUY CE. Mirror it for BUY PE."
+
+  Dot      = EMA9 crossover event (script's plotshape circle)
+  Triangle = Hull ribbon flip event (script's plotshape triangle)
+
+Full logic lives in indicators.harish_recommendation() -- read that
+docstring for the exact two-candle sequence.
 
 OUTPUT FILES
 ------------
-Dated workbook : 'DD-Mon-YY FNO-L-MACD.xlsx' / '-BT-MACD.xlsx'
-                 (paths.dated_workbook_path_macd -- distinct from the
-                 original's '...-TW-ALL.xlsx' naming)
-Backtest report: 'Backtest MACD <first> to <last>.xlsx' (+ matching .html)
-                 (distinct from the original's 'Backtest TW-ALL <first> to
-                 <last>.xlsx', and from rebuild_dashboard.py's default name)
+Dated workbook : 'DD-Mon-YY FNO-L-HARISH.xlsx' / '-BT-HARISH.xlsx'
+                 (paths.dated_workbook_path_harish -- distinct from every
+                 other pipeline's naming)
+Backtest report: 'Backtest HARISH <first> to <last>.xlsx' (+ matching .html)
 
 STEPS
 -----
-     1  bootstrap.py        install missing packages
-     2  broker_auth.py      Angel One (headless TOTP) + Zerodha (cached/Selenium)
-     3  calendar_mgmt.py    LIVE or BACKTEST, validate dates against NSE calendar
-     4  file_mgmt.py        copy 01_SourceFile.xlsx -> 'DD-Mon-YY FNO-L-MACD.xlsx'
-     5  token_mgmt.py       resolve symbols -> Zerodha instrument tokens
-     6  angel_scrip.py      download Angel One scrip master (weekly cache)
-     7  data_ingestion.py   5-min candles, cached, no unclosed bars
-     8  matrix_sheets_v2.py RSI + ADX + EMA VWAP + MACD matrix sheets + Final
-     9  option_chain.py     ATM strike, +/-2 window, quotes
-    10  option_audit.py     PCR / OI / spread / liquidity / cost viability
-    11  order_engine.py     qualification -> sizing -> exit ladder -> Orders
-    12  live_loop.py        LIVE only: fetch at candle close + 5s
-    13  dashboard.py        KPI panels, LIVE and PAPER kept separate
-    14  excel_format.py     auto-fit columns, colour the Final Recomm row
+     1  bootstrap.py           install missing packages
+     2  broker_auth.py         Angel One (headless TOTP) + Zerodha (cached/Selenium)
+     3  calendar_mgmt.py       LIVE or BACKTEST, validate dates against NSE calendar
+     4  file_mgmt.py           copy 01_SourceFile.xlsx -> 'DD-Mon-YY FNO-L-HARISH.xlsx'
+     5  token_mgmt.py          resolve symbols -> Zerodha instrument tokens
+     6  angel_scrip.py         download Angel One scrip master (weekly cache)
+     7  data_ingestion.py      5-min candles, cached, no unclosed bars
+     8  matrix_sheets_harish.py  Harish matrix sheet + Final
+     9  option_chain.py        ATM strike, +/-2 window, quotes
+    10  option_audit.py        off by default (config.HARISH_AUDIT_ENABLED)
+    11  order_engine.py        qualification -> sizing -> exit ladder -> Orders
+    12  live_loop.py           LIVE only: fetch at candle close + 5s
+    13  dashboard.py           KPI panels, LIVE and PAPER kept separate
+    14  excel_format.py        auto-fit columns, colour the Final Recomm row
 
 Steps 9-11 need an Angel One session. Without one the run still produces the
 matrix sheets and says plainly that the order sheets were skipped -- it does
@@ -53,6 +72,10 @@ not write empty Orders/Rejected sheets that look like "no signals today".
 
 NOTHING HERE PLACES A BROKER ORDER. Every position is PAPER until
 config.LIVE_TRADING is True and an order-placement module exists.
+
+This isn't financial advice, and past backtest performance never guarantees
+future results -- paper-trade any signal from this pipeline before risking
+real capital, same as every other pipeline in this project.
 """
 
 from __future__ import annotations
@@ -62,11 +85,11 @@ import traceback
 from datetime import date
 
 import bootstrap
-import matrix_sheets_v2
+import matrix_sheets_harish
 
 
 def _banner(step, title: str) -> None:
-    print(f"\n{'=' * 70}\nSTEP {step} — {title}  [v2: MACD]\n{'=' * 70}")
+    print(f"\n{'=' * 70}\nSTEP {step} — {title}  [HARISH: TW EMA + VWAP]\n{'=' * 70}")
 
 
 def run_one_date(trade_date: date, mode: str, kite, angel,
@@ -87,12 +110,12 @@ def run_one_date(trade_date: date, mode: str, kite, angel,
     import token_mgmt
 
     stamp = calendar_mgmt.format_date(trade_date)
-    print(f"\n{'#' * 70}\n#  {stamp}  [{mode}]  -- PIPELINE V2 (MACD)\n{'#' * 70}")
+    print(f"\n{'#' * 70}\n#  {stamp}  [{mode}]  -- PIPELINE HARISH (TW EMA + VWAP)\n{'#' * 70}")
 
     # ---- 4. trade file --------------------------------------------------
     _banner(4, "Trade file")
     workbook = file_mgmt.create_trade_file(
-        trade_date, mode, path_fn=paths.dated_workbook_path_macd)
+        trade_date, mode, path_fn=paths.dated_workbook_path_harish)
 
     # ---- 5. Zerodha tokens ----------------------------------------------
     _banner(5, "Zerodha instrument tokens")
@@ -129,7 +152,7 @@ def run_one_date(trade_date: date, mode: str, kite, angel,
     df_ref = token_mgmt.add_day_ohlc(df_ref, candles, trade_date)
     file_mgmt.write_sheet(workbook, config.WATCHLIST_SHEET, df_ref)
 
-    # ---- 7b/7c. index + VIX gates -- same as v1, kept for parity ----------
+    # ---- 7b/7c. index + VIX gates -- same as run_TW_ALL.py, kept for parity --
     index_candles = None
     if config.REGIME_FILTER_ENABLED:
         try:
@@ -168,15 +191,15 @@ def run_one_date(trade_date: date, mode: str, kite, angel,
         except Exception as exc:
             print(f"[pipeline] VIX feed unavailable ({exc}) -- gate SKIPPED")
 
-    # ---- 8. matrix sheets (v2: RSI + ADX + EMA VWAP + MACD) ----------------
+    # ---- 8. matrix sheets (Harish TW EMA + VWAP) ---------------------------
     _banner(8, "Matrix sheets")
-    built = matrix_sheets_v2.build_all_sheets_v2(workbook, candles, trade_date)
+    built = matrix_sheets_harish.build_all_sheets_harish(workbook, candles, trade_date)
     final_df = built[config.FINAL_SHEET_NAME]
     slots = ist_clock.candle_slots(
         trade_date, config.INTERVAL_MINUTES,
         pd.Timestamp(config.MATRIX_LAST_SLOT).time())
 
-    # ---- 9-11. order engine (unchanged from v1) ----------------------------
+    # ---- 9-11. order engine (unchanged from run_TW_ALL.py) -----------------
     _banner("9-11", "Option chain, audit, orders")
     orders_df = rejected_df = None
 
@@ -201,7 +224,7 @@ def run_one_date(trade_date: date, mode: str, kite, angel,
             final_df, df_ref, candles, scrip, angel, trade_date, mode,
             slots, available_capital=capital, index_candles=index_candles,
             vix_candles=vix_candles, kite=kite,
-            audit_enabled=config.MACD_AUDIT_ENABLED)
+            audit_enabled=config.HARISH_AUDIT_ENABLED)
 
         file_mgmt.write_sheet(workbook, "Orders", orders_df)
         file_mgmt.write_sheet(workbook, "Rejected", rejected_df)
@@ -229,29 +252,29 @@ def run_one_date(trade_date: date, mode: str, kite, angel,
     _banner(14, "Workbook formatting")
     excel_format.format_workbook(workbook)
 
-    print(f"\n[pipeline-v2] {stamp} done -> {workbook.name}")
-    print(f"[pipeline-v2] sheets now in file: {file_mgmt.list_sheets(workbook)}")
+    print(f"\n[pipeline-harish] {stamp} done -> {workbook.name}")
+    print(f"[pipeline-harish] sheets now in file: {file_mgmt.list_sheets(workbook)}")
 
 
 def _write_skeleton_matrix_sheets(workbook, symbols: list[str],
                                   trade_date: date) -> None:
-    """v2 equivalent of run_TW_ALL._write_skeleton_matrix_sheets."""
+    """Harish equivalent of run_TW_ALL._write_skeleton_matrix_sheets."""
     import config
     import file_mgmt
     import pandas as pd
     from matrix_sheets import build_matrix
 
     empty_frames = {sym: pd.DataFrame() for sym in symbols}
-    for sheet_name, metrics in config.MATRIX_SHEETS_V2.items():
+    for sheet_name, metrics in config.MATRIX_SHEETS_HARISH.items():
         df = build_matrix(sheet_name, empty_frames, trade_date, metrics)
         file_mgmt.write_sheet(workbook, sheet_name, df)
     final_df = build_matrix(
-        config.FINAL_SHEET_NAME, empty_frames, trade_date, config.FINAL_ROWS_V2)
+        config.FINAL_SHEET_NAME, empty_frames, trade_date, config.FINAL_ROWS_HARISH)
     file_mgmt.write_sheet(workbook, config.FINAL_SHEET_NAME, final_df)
 
 
 def setup_live_day(trade_date: date, kite, angel):
-    """v2 equivalent of run_TW_ALL.setup_live_day. See that function's
+    """Harish equivalent of run_TW_ALL.setup_live_day. See that function's
     docstring for why this two-phase setup exists."""
     import angel_scrip
     import config
@@ -263,7 +286,7 @@ def setup_live_day(trade_date: date, kite, angel):
 
     _banner(4, "Trade file")
     workbook = file_mgmt.create_trade_file(
-        trade_date, config.LIVE, path_fn=paths.dated_workbook_path_macd)
+        trade_date, config.LIVE, path_fn=paths.dated_workbook_path_harish)
 
     _banner(5, "Zerodha instrument tokens")
     df_ref = token_mgmt.update_instrument_tokens(
@@ -302,7 +325,7 @@ def setup_live_day(trade_date: date, kite, angel):
 
 
 def run_live_day(trade_date: date, kite, angel) -> None:
-    """v2 equivalent of run_TW_ALL.run_live_day."""
+    """Harish equivalent of run_TW_ALL.run_live_day."""
     import config
     import data_ingestion
     import dashboard
@@ -331,7 +354,7 @@ def run_live_day(trade_date: date, kite, angel) -> None:
         df_ref_now = token_mgmt.add_day_ohlc(df_ref, candles, trade_date)
         file_mgmt.write_sheet(workbook, config.WATCHLIST_SHEET, df_ref_now)
 
-        built = matrix_sheets_v2.build_all_sheets_v2(workbook, candles, trade_date)
+        built = matrix_sheets_harish.build_all_sheets_harish(workbook, candles, trade_date)
         final_df = built[config.FINAL_SHEET_NAME]
 
         _banner("9-11", f"{slot}: qualify signals, advance open positions")
@@ -421,6 +444,18 @@ def main() -> int:
     import config
     import paths
 
+    # Relax the shared order-engine qualification gate for THIS process only
+    # (Harish, 12-Sep-26: "No need to wait for 2 BUY signals now") -- Harish
+    # Recomm is already a one-bar decisive event (see
+    # indicators.harish_recommendation), so waiting for config's default
+    # CONSECUTIVE_SIGNALS_REQUIRED==2 identical bars in a row would mean it
+    # almost never qualifies for an order. run_TW_ALL.py/run_MACD.py/
+    # run_EMA_PIVOT.py each run as their own separate python process with
+    # their own fresh import of config, so this assignment never touches
+    # their behaviour -- see config.HARISH_CONSECUTIVE_SIGNALS_REQUIRED's
+    # own comment.
+    config.CONSECUTIVE_SIGNALS_REQUIRED = config.HARISH_CONSECUTIVE_SIGNALS_REQUIRED
+
     paths.ensure_dirs()
     print("\n" + paths.describe())
     problems = paths.verify_layout()
@@ -448,7 +483,8 @@ def main() -> int:
         print("[auth] continuing with Zerodha only -- matrix sheets will be "
               "built, order sheets will be skipped")
 
-    print("\nPipeline V2 confluence: RSI + ADX + EMA20-VWAP + MACD (no TW ALL)")
+    print("\nPipeline HARISH confluence: Harish TW EMA + VWAP only "
+          "(Dot + Triangle 2-candle rule, no TW ALL/RSI/ADX/MACD)")
     if config.LIVE_TRADING:
         print("\n[pipeline] WARNING: LIVE_TRADING is True in config.py")
     else:
@@ -464,7 +500,7 @@ def main() -> int:
             print(f"\n[pipeline] {calendar_mgmt.format_date(dates[0])} FAILED:")
             traceback.print_exc()
             return 1
-        print(f"\n{'=' * 70}\nPIPELINE V2 COMPLETE — LIVE session\n{'=' * 70}")
+        print(f"\n{'=' * 70}\nPIPELINE HARISH COMPLETE — LIVE session\n{'=' * 70}")
         return 0
 
     accumulator = None
@@ -491,10 +527,9 @@ def main() -> int:
         accumulator.print_summary()
         if config.AUTO_CONSOLIDATED_REPORT:
             first, last = dates[0], dates[-1]
-            # 'MACD' in the name -- distinct from run_TW_ALL.py's own
-            # 'Backtest TW-ALL <first> to <last>.xlsx', so neither run
-            # overwrites the other's consolidated report.
-            out = paths.BASE_DIR / (f"Backtest MACD {calendar_mgmt.format_date(first)} "
+            # 'HARISH' in the name -- distinct from every other pipeline's
+            # own consolidated report, so none of them overwrite another.
+            out = paths.BASE_DIR / (f"Backtest HARISH {calendar_mgmt.format_date(first)} "
                                     f"to {calendar_mgmt.format_date(last)}.xlsx")
             accumulator.write(out)
         else:
@@ -503,7 +538,7 @@ def main() -> int:
                   "`py rebuild_dashboard.py` to build it manually")
 
     print(f"\n{'=' * 70}")
-    print(f"PIPELINE V2 COMPLETE — {len(dates)} date(s), {failures} failure(s)")
+    print(f"PIPELINE HARISH COMPLETE — {len(dates)} date(s), {failures} failure(s)")
     print(f"{'=' * 70}")
     return 1 if failures else 0
 

@@ -157,6 +157,80 @@ def qualified_signals(final_df: pd.DataFrame,
     return out
 
 
+# The candle each signal needs its confirming bar to close as.
+_CANDLE_NEEDED = {
+    config.SIGNAL_BUY_CE: config.CANDLE_BULLISH,
+    config.SIGNAL_BUY_PE: config.CANDLE_BEARISH,
+}
+
+
+def candle_confirms(final_df: pd.DataFrame, run: SignalRun) -> tuple[bool, str]:
+    """
+    THE FIRST GATE (02-Sep-26, Harish). Did price itself agree with the
+    signal on the run's SECOND bar?
+
+        BUY CE -> that bar must close Bullish (close > open)
+        BUY PE -> that bar must close Bearish (close < open)
+        Doji   -> fails. "Must close Bullish" is not satisfied by flat.
+
+    Reads the Final sheet's own "Candle" row -- the same row the workbook
+    displays and the same one confirmed_recommendation() judges -- rather
+    than recomputing from candles, so what the sheet shows and what the
+    order engine did can never drift apart. Returns (ok, reason); the
+    reason goes straight onto the Rejected sheet.
+
+    Order matters: this runs before VIX, regime, volatility, RSI-extreme,
+    candle momentum, tradeability, ranking and the entire option audit.
+    A run the market contradicted is out before it costs a quote call.
+
+    Fails OPEN, with a printed warning, when the Candle row simply isn't
+    there (a workbook built before 02-Sep-26) or the cell is blank. The
+    alternative -- treating "I can't tell" as "no" -- would silently halt
+    every trade on an old file, which is a worse failure than one extra
+    trade. A row that IS present and says Doji/opposite is a real answer
+    and is rejected.
+    """
+    if not config.FINAL_CANDLE_CONFIRM_REQUIRED:
+        return True, ""
+
+    needed = _CANDLE_NEEDED.get(run.signal)
+    if needed is None:                    # not an actionable signal
+        return True, ""
+
+    trigger = run.trigger_slots
+    if len(trigger) < 2:                  # CONSECUTIVE_SIGNALS_REQUIRED == 1
+        return True, ""
+    slot = trigger[1]                     # the 2nd bar of the run
+
+    # No "Candle" row anywhere in this Final sheet: not an error, just a
+    # pipeline that doesn't build one. run_MACD.py and run_EMA_PIVOT.py use
+    # config.FINAL_ROWS_V2 / FINAL_ROWS_EMA_PIVOT, neither of which carries
+    # it. Skip silently -- warning once per signal on every run of those two
+    # would be noise about a rule they were never asked to follow.
+    if not (final_df["Metrics"] == "Candle").any():
+        return True, ""
+
+    rows = final_df[(final_df["Symbol"].astype(str) == run.symbol)
+                    & (final_df["Metrics"] == "Candle")]
+    if rows.empty or slot not in final_df.columns:
+        print(f"[orders] WARNING: no 'Candle' row for {run.symbol} at {slot} "
+              f"-- 2nd-candle confirmation skipped for this signal. Rebuild "
+              f"the matrix sheets if this is not an old workbook.")
+        return True, ""
+
+    value = rows.iloc[0].get(slot, "")
+    value = "" if pd.isna(value) else str(value).strip()
+    if value == "":
+        print(f"[orders] WARNING: blank 'Candle' cell for {run.symbol} at "
+              f"{slot} -- 2nd-candle confirmation skipped for this signal.")
+        return True, ""
+
+    if value == needed:
+        return True, ""
+    return False, (f"{run.symbol}: 2nd candle at {slot} closed {value}, "
+                   f"{run.signal} needs {needed} -- not moved to Orders")
+
+
 # --------------------------------------------------------------------------
 # position
 # --------------------------------------------------------------------------
@@ -173,12 +247,20 @@ class Position:
 
     stop_loss: float = 0.0
     targets: tuple = ()
-    target_hit: list[bool] = field(default_factory=lambda: [False, False, False])
+    # Sized off config.TARGET_MULTS (10 levels as of 12-Sep-26, was 3) rather
+    # than a fixed [False, False, False] -- a mismatch here means
+    # pos.target_hit[i] IndexErrors the moment T4+ is checked.
+    target_hit: list[bool] = field(
+        default_factory=lambda: [False] * len(config.TARGET_MULTS))
     remaining_qty: int = 0
     peak_ltp: float = 0.0
     trough_ltp: float = 0.0
     breakeven_active: bool = False
     tsl_breach_streak: int = 0
+    # Guards order_engine._tighten_stop_after_adverse_first_candle so it
+    # only ever acts once per position, on the first underlying candle that
+    # closes after entry (12-Sep-26, see that function's docstring).
+    first_candle_checked: bool = False
 
     realised_pnl: float = 0.0
     exits: list[dict] = field(default_factory=list)
@@ -219,6 +301,21 @@ class Position:
     # what keeps a repeat cycle from re-evaluating, and re-ordering against,
     # a bar it already handled. Always None for PAPER positions.
     last_processed_bar: datetime | None = None
+
+    # Latest UNDERLYING 5-min slot already scanned for a signal-invalidation
+    # exit (MACD Invalidation / Harish Invalidation / Harish Dot Reversal) --
+    # BUG FOUND 15-Sep-26 (AUBANK, see order_engine._signal_invalidation_
+    # reason's docstring): these checks used to run only against the
+    # timestamp of the current OPTION candle, but Dot/Triangle etc. are
+    # one-bar events on the UNDERLYING's grid, and a thinly traded option's
+    # own candle series can have gaps that skip the exact bar an event fired
+    # on -- silently missing the exit forever. Tracking the underlying slot
+    # already covered lets the scan sweep every slot since the last check,
+    # not just whichever one the option happened to print a bar for. None
+    # until the first check; reset to None on a PAPER replay (which rebuilds
+    # `pos` fresh from its entry snapshot every cycle, same as every other
+    # per-position field here), carried forward in place for a LIVE position.
+    last_invalidation_ts: datetime | None = None
 
     # The moment the third bar of the trio CLOSED -- i.e. the earliest instant
     # this trade could honestly have been known about. Recorded so the gap
@@ -460,19 +557,27 @@ def update_position(pos: Position, ltp: float, now: datetime,
         pos.tsl_breach_streak = 0
 
     # --- targets, partial exits ------------------------------------------
+    # No more "last target = close everything" (12-Sep-26, Harish: "I dont
+    # want code to stop at T3 Hit alone, let it continue till the exit
+    # time"). EVERY level, including the last configured one, is now just a
+    # partial exit like T1/T2 always were -- config.TARGET_EXIT_FRACTIONS
+    # deliberately sums to <1.0, so whatever's left after the last level
+    # keeps riding, closing only via the trailing stop (above), EOD
+    # Square-off, or a signal-invalidation exit -- never because it simply
+    # touched the highest configured target. _partial() below already
+    # closes the position on its own if a partial ever exhausts
+    # remaining_qty to 0, so nothing here needs to force that.
     for i, target in enumerate(pos.targets):
         if pos.target_hit[i] or ltp < target - PRICE_EPS:
             continue
         pos.target_hit[i] = True
 
-        if i == len(pos.targets) - 1:
-            fired.append(_close(pos, ltp, now, f"Target {i + 1} Hit"))
-            return fired
-
         qty = target_exit_qty(pos.quantity, pos.lot_size,
                               config.TARGET_EXIT_FRACTIONS[i], pos.remaining_qty)
         if qty > 0:
             fired.append(_partial(pos, ltp, now, qty, f"Target {i + 1} Hit"))
+            if pos.closed:
+                return fired
 
         if i == 0 and config.MOVE_SL_TO_BREAKEVEN_AT_T1:
             pos.breakeven_active = True
@@ -593,6 +698,15 @@ def size_position(entry_ltp: float, lot_size: int,
 # --------------------------------------------------------------------------
 # sheet builders
 # --------------------------------------------------------------------------
+# Target 1..N LTP / T1..TN Hit -- N = len(config.TARGET_MULTS) (10 as of
+# 12-Sep-26, was a hardcoded 3; see the target-ladder rework in
+# update_position). Built once at import time from however many levels
+# config actually defines, so adding/removing a level never means hunting
+# down a hardcoded column list by hand again.
+_N_TARGETS = len(config.TARGET_MULTS)
+TARGET_LTP_COLUMNS = [f"Target {i} LTP" for i in range(1, _N_TARGETS + 1)]
+TARGET_HIT_COLUMNS = [f"T{i} Hit" for i in range(1, _N_TARGETS + 1)]
+
 ORDER_COLUMNS = [
     "Symbol", "Signal", "Entry Type", "OI Check",
     "Pre-Entry Trigger Time", "Pre-Entry Trigger Status",
@@ -602,11 +716,11 @@ ORDER_COLUMNS = [
     "Spot Price", "ATM Strike", "Option Symbol", "Option Token", "Lot Size",
     "Days To Expiry", "Signal Confirmed At", "Entry Time", "Entry Lag (min)",
     "Lookahead Check", "Entry LTP",
-    "Stop Loss LTP", "Target 1 LTP", "Target 2 LTP", "Target 3 LTP",
+    "Stop Loss LTP", *TARGET_LTP_COLUMNS,
     "Risk/Unit (Rs)", "Quantity (Lots)", "Quantity (Units)",
     "Risk Amount (Rs)", "Capital Required (Rs)",
     "Current LTP", "Max LTP", "Min LTP",
-    "T1 Hit", "T2 Hit", "T3 Hit", "Breakeven Active", "TSL Breach Streak",
+    *TARGET_HIT_COLUMNS, "Breakeven Active", "TSL Breach Streak",
     "Effective Stop", "Gross P/L (Rs)", "Costs (Rs)", "Net P/L (Rs)",
     "Order ID", "Exit Time", "Exit Reason", "Trade Mode",
     "Broker Order ID", "Actual Fill Price", "Actual Exit Price", "Exit Order ID",
@@ -659,9 +773,8 @@ def position_to_row(pos: Position, current_ltp: float | None = None) -> dict:
                             else "FAIL: filled before signal confirmed"),
         "Entry LTP": round(pos.entry_ltp, 2),
         "Stop Loss LTP": round(pos.stop_loss, 2),
-        "Target 1 LTP": round(pos.targets[0], 2),
-        "Target 2 LTP": round(pos.targets[1], 2),
-        "Target 3 LTP": round(pos.targets[2], 2),
+        **{col: round(pos.targets[i], 2)
+           for i, col in enumerate(TARGET_LTP_COLUMNS) if i < len(pos.targets)},
         "Risk/Unit (Rs)": round(pos.risk_per_unit, 2),
         "Quantity (Lots)": pos.lots,
         "Quantity (Units)": pos.quantity,
@@ -670,9 +783,8 @@ def position_to_row(pos: Position, current_ltp: float | None = None) -> dict:
         "Current LTP": round(current_ltp, 2) if current_ltp else "",
         "Max LTP": round(pos.peak_ltp, 2),
         "Min LTP": round(pos.trough_ltp, 2),
-        "T1 Hit": "YES" if pos.target_hit[0] else "",
-        "T2 Hit": "YES" if pos.target_hit[1] else "",
-        "T3 Hit": "YES" if pos.target_hit[2] else "",
+        **{col: ("YES" if pos.target_hit[i] else "")
+           for i, col in enumerate(TARGET_HIT_COLUMNS) if i < len(pos.target_hit)},
         "Breakeven Active": "YES" if pos.breakeven_active else "",
         "TSL Breach Streak": pos.tsl_breach_streak,
         "Effective Stop": round(pos.effective_stop, 2),

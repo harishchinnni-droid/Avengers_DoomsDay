@@ -241,6 +241,240 @@ def _macd_invalidated(final_df: pd.DataFrame, candles: dict, symbol: str,
     return macd_now != signal
 
 
+def _harish_invalidated(final_df: pd.DataFrame, symbol: str, signal: str,
+                        bar_open_ts: datetime) -> bool:
+    """
+    Early-exit check for run_HARISH.py positions (12-Sep-26, Harish: ALKEM
+    BUY PE entered 10:30 ran unchanged to EOD Square-off even though
+    Dot/Triangle turned Green/Green again at 11:00-11:05 -- "Check the code
+    why the order did not exit"). Root cause was that NOTHING watched for
+    this: order_engine's only signal-based early exit was _macd_invalidated
+    above, hardcoded to the MACD pipeline's own "MACD Recomm" column --
+    every other pipeline's positions (TW ALL, EMA-Pivot, Harish) only ever
+    exited on Stop Loss, Target/Trailing SL, or EOD Square-off.
+
+    Deliberately simpler than _macd_invalidated: that check needed a
+    separate underlying-candle-colour cross-check because a MACD line/signal
+    cross can persist across several candles of either colour. Harish
+    Recomm has no such ambiguity -- it is already a one-bar decisive event
+    (adjacent same-colour Dot/Triangle markers PLUS that bar's own candle
+    confirming direction, see indicators.harish_recommendation), so Harish
+    Recomm reading the OPPOSITE signal on this closed candle IS the
+    cross-check; no extra candle-colour read is needed.
+
+    Fires when this closed bar's Harish Recomm (read from the Final sheet,
+    same slot-column shape _macd_invalidated reads) is the OPPOSITE of the
+    position's own signal -- BUY PE recorded while holding BUY CE, or vice
+    versa. WAIT, blank (warm-up/no data), or a repeat of the SAME signal
+    changes nothing -- only a genuine flip closes the position.
+
+    Reads the Final sheet rather than `candles`/matrix_sheets_harish
+    directly so this works uniformly for both BACKTEST's full-day final_df
+    and LIVE's per-cycle final_df, exactly like _macd_invalidated.
+    """
+    if not config.HARISH_INVALIDATION_EXIT_ENABLED:
+        return False
+    if signal not in (config.SIGNAL_BUY_CE, config.SIGNAL_BUY_PE):
+        return False
+
+    row = final_df[(final_df["Symbol"] == symbol)
+                   & (final_df["Metrics"] == "Harish Recomm")]
+    slot = bar_open_ts.strftime("%H:%M")
+    if row.empty or slot not in row.columns:
+        return False  # not a Harish workbook, or no data yet -- don't guess
+
+    now_signal = row[slot].iloc[0]
+    now_signal = "" if pd.isna(now_signal) else str(now_signal).strip()
+    if now_signal == "":
+        return False  # WAIT/blank -- still holding, nothing broke
+
+    opposite = (config.SIGNAL_BUY_PE if signal == config.SIGNAL_BUY_CE
+               else config.SIGNAL_BUY_CE)
+    return now_signal == opposite
+
+
+def _harish_dot_fast_exit(final_df: pd.DataFrame, symbol: str, signal: str,
+                          bar_open_ts: datetime) -> bool:
+    """
+    Faster, looser sibling of _harish_invalidated (12-Sep-26,
+    AUROBINDOPHARMA: "Look out for next green dot in BUY PE situation and
+    exit immd. Look out for next red dot in BUY CE situation and exit
+    immd.").
+
+    _harish_invalidated needs the FULL Harish Recomm reversal -- adjacent
+    same-colour Dot/Triangle markers PLUS the second bar's candle
+    confirming direction. This one fires on a single OPPOSITE-colour Dot
+    alone, no Triangle and no candle confirmation required, because Harish
+    wants out the moment the EMA9 cross alone hints the move is turning,
+    not once the full reversal has actually confirmed. Reads the "Dot" row
+    indicators.compute_harish exposes unmerged in the Final sheet (see
+    config.FINAL_ROWS_HARISH) purely for this -- the visible per-symbol
+    sheet still only shows the merged "Dot/Triangle" column.
+
+    Runs ALONGSIDE _harish_invalidated, not instead of it -- whichever
+    fires first on a given closed bar closes the position; this one will
+    typically fire first since it needs less to agree.
+    """
+    if not config.HARISH_DOT_FAST_EXIT_ENABLED:
+        return False
+    if signal not in (config.SIGNAL_BUY_CE, config.SIGNAL_BUY_PE):
+        return False
+
+    row = final_df[(final_df["Symbol"] == symbol) & (final_df["Metrics"] == "Dot")]
+    slot = bar_open_ts.strftime("%H:%M")
+    if row.empty or slot not in row.columns:
+        return False  # not a Harish workbook, or no data yet -- don't guess
+
+    dot_now = row[slot].iloc[0]
+    dot_now = "" if pd.isna(dot_now) else str(dot_now).strip()
+    if dot_now == "":
+        return False  # no Dot on this bar -- nothing to react to
+
+    if signal == config.SIGNAL_BUY_PE and dot_now == "Green":
+        return True
+    if signal == config.SIGNAL_BUY_CE and dot_now == "Red":
+        return True
+    return False
+
+
+def _signal_invalidation_reason(final_df: pd.DataFrame, candles: dict,
+                                symbol: str, signal: str,
+                                since_ts_exclusive: datetime,
+                                upto_ts_inclusive: datetime) -> str:
+    """
+    Scan every UNDERLYING 5-min slot in (since_ts_exclusive, upto_ts_inclusive]
+    for a signal-invalidation exit -- MACD Invalidation, Harish Invalidation,
+    then Harish Dot Reversal, in that priority order, same as the three used
+    to be checked individually. Returns the first reason that fires, or ""
+    if none did across the whole window.
+
+    BUG FOUND 15-Sep-26 (AUBANK, Harish: "Green dot by which the trade
+    should exit... backtest result... exited only at EOD Square off"). All
+    three checks used to be called with ONLY the current closed OPTION
+    candle's own timestamp (`ts` from `opt_candles.iterrows()`). Dot/
+    Triangle/MACD Recomm/Harish Recomm are one-bar EVENTS on the
+    UNDERLYING's grid (see indicators._cross_event's docstring -- a marker
+    is present only on the exact bar it fires, blank every bar after), and
+    the underlying always has a complete 5-min series. A thinly traded
+    OPTION contract's own candle series does not -- AUBANK's Dot fired
+    Green at 12:30 (confirmed: read directly off the real Final sheet for
+    this exact backtest), a genuine BUY PE exit signal, but if that specific
+    option had no printed candle exactly at 12:30 (very plausible for an
+    OTM/quiet contract), the single slot where the event lived was silently
+    skipped forever -- the position ran unchanged to EOD Square-off and
+    booked a loss the rule should have prevented.
+
+    Fix: scan every UNDERLYING slot since the LAST time this position was
+    checked, not just the current option bar's one slot -- so whichever
+    option bar comes next after a missed event still catches it. The exit
+    still only executes at the current option bar's close (the earliest
+    price actually available to trade at), same as before; only which
+    underlying slots get examined for the trigger has changed.
+    """
+    und = _as_ist(candles.get(symbol))
+    if und is None or und.empty:
+        return ""
+    window = und[(und.index > since_ts_exclusive) & (und.index <= upto_ts_inclusive)]
+    for ts in window.index:
+        ts = ts.to_pydatetime()
+        if _macd_invalidated(final_df, candles, symbol, signal, ts):
+            return "MACD Invalidation"
+        if _harish_invalidated(final_df, symbol, signal, ts):
+            return "Harish Invalidation"
+        if _harish_dot_fast_exit(final_df, symbol, signal, ts):
+            return "Harish Dot Reversal"
+    return ""
+
+
+def _tighten_stop_after_adverse_first_candle(pos: Position, candles: dict,
+                                             symbol: str,
+                                             bar_open_ts: datetime) -> None:
+    """
+    (12-Sep-26, Harish: AUROBINDOPHARMA BUY PE entered 09:15, the very next
+    09:20 candle closed Bullish against the trade, and it still rode the
+    full ATR stop down to a ~Rs 2,000 loss -- "keep the stop loss to the
+    previous candle so that we can exit faster instead of losing 2k
+    fully"). Applies to EVERY pipeline -- only needs the position's own
+    signal and the underlying's own candles, no pipeline-specific
+    indicator, unlike the two Harish-only checks above.
+
+    Runs ONCE per position (guarded by pos.first_candle_checked), on the
+    FIRST underlying candle that closes strictly after entry. If that
+    candle closed AGAINST the position's direction (Bullish while holding
+    BUY PE, Bearish while holding BUY CE), the stop is tightened -- NEVER
+    loosened, only raised towards entry_ltp -- to whatever ATM-delta-
+    equivalent premium distance corresponds to the underlying's PREVIOUS
+    candle (the entry/signal candle) extreme: its high for a PE (price
+    rising back above it breaks the bearish setup), its low for a CE.
+
+    Converts the underlying distance to premium terms via
+    config.ATM_DELTA_APPROX, the SAME factor order_sheet.compute_stop_price
+    already uses to turn underlying ATR into a premium stop distance -- so
+    this stays consistent with how the normal stop is sized, just anchored
+    to one specific nearby candle instead of an ATR average, and clamps to
+    never be tighter than the position's already-computed stop (a
+    tightening move can only ever raise stop_loss, never lower it).
+
+    Mutates pos.stop_loss in place and relies on the EXISTING SL-check
+    machinery (pos.effective_stop, checked every observation in
+    order_sheet.update_position/_evaluate_live_tick) to act on it from the
+    next observation onward -- no separate exit path needed.
+
+    Called on every bar of the post-entry walk, at every one of this
+    module's 3 bar-walk sites -- `pos.first_candle_checked` is what makes
+    it a no-op after the first call, not the caller. Every one of those
+    walks already only visits bars STRICTLY AFTER entry_time (see e.g. the
+    `opt_candles.index > fill_time` filter in _try_build_position), so the
+    first bar this ever sees IS "the immediate next candle after entry" --
+    there is no need to separately test bar_open_ts against pos.entry_time.
+    The PREVIOUS candle it anchors to is pos.entry_time itself (the entry/
+    signal candle), read directly rather than as `bar_open_ts - one
+    interval`, so a market-open gap or a missing bar can't silently point
+    this at the wrong candle.
+    """
+    if pos.first_candle_checked:
+        return
+    pos.first_candle_checked = True
+    if not config.EARLY_CANDLE_TIGHTEN_ENABLED:
+        return
+    if pos.signal not in (config.SIGNAL_BUY_CE, config.SIGNAL_BUY_PE):
+        return
+
+    und = _as_ist(candles.get(symbol))
+    if und is None or und.empty or bar_open_ts not in und.index:
+        return  # no underlying bar to read -- don't guess
+
+    prev_ts = pos.entry_time
+    if prev_ts not in und.index:
+        return  # entry candle not found in the underlying frame -- don't guess
+
+    o, c = float(und.loc[bar_open_ts, "open"]), float(und.loc[bar_open_ts, "close"])
+    prev_h = float(und.loc[prev_ts, "high"])
+    prev_l = float(und.loc[prev_ts, "low"])
+
+    if pos.signal == config.SIGNAL_BUY_PE:
+        adverse = c > o              # first candle closed Bullish -- against a PE
+        underlying_level = prev_h    # previous candle's high
+    else:
+        adverse = c < o              # first candle closed Bearish -- against a CE
+        underlying_level = prev_l    # previous candle's low
+    if not adverse:
+        return
+
+    underlying_distance = abs(c - underlying_level)
+    if underlying_distance <= 0:
+        return
+
+    tighter_stop = pos.entry_ltp - underlying_distance * config.ATM_DELTA_APPROX
+    if tighter_stop > pos.stop_loss:
+        print(f"[risk] {symbol}: first candle after entry closed against "
+              f"the {pos.signal} trade -- tightening stop "
+              f"{pos.stop_loss:.2f} -> {tighter_stop:.2f} (previous "
+              f"candle's {'high' if pos.signal == config.SIGNAL_BUY_PE else 'low'} "
+              f"{underlying_level:.2f})")
+        pos.stop_loss = round(tighter_stop, 2)
+
+
 # --------------------------------------------------------------------------
 # real-position management -- shared by the 5-min bar walk
 # (advance_live_day's _advance_live_position) AND the 30-60s fast tracker
@@ -380,13 +614,19 @@ def _evaluate_live_tick(angel, pos: Position, when: datetime, ltp: float,
         # stop ratchet.
         if i == 0 and config.MOVE_SL_TO_BREAKEVEN_AT_T1:
             pos.breakeven_active = True
-        is_final_target = (i == len(pos.targets) - 1)
-        qty = (pos.remaining_qty if is_final_target else
-              order_sheet.target_exit_qty(
-                  pos.quantity, pos.lot_size,
-                  config.TARGET_EXIT_FRACTIONS[i], pos.remaining_qty))
+        # No more "last configured target = sell everything" (12-Sep-26,
+        # Harish: "I dont want code to stop at T3 Hit alone, let it
+        # continue till the exit time"). Every level is now a partial exit
+        # via target_exit_qty, same as order_sheet.update_position's
+        # BACKTEST/PAPER path -- whether THIS particular exit happens to
+        # finish the position off is now decided by whether qty reaches
+        # pos.remaining_qty, not by which target index fired.
+        qty = order_sheet.target_exit_qty(
+            pos.quantity, pos.lot_size,
+            config.TARGET_EXIT_FRACTIONS[i], pos.remaining_qty)
         if qty <= 0:
             continue
+        is_final_target = qty >= pos.remaining_qty
         try:
             _real_exit(angel, pos, qty, f"Target {i + 1} Hit", when, is_final_target)
         except live_orders.LiveOrderError as exc:
@@ -493,21 +733,27 @@ def _write_live_status_snapshot(state: dict) -> None:
     import csv
     rows = []
     for p in state["live_positions"].values():
-        rows.append({
+        row = {
             "Symbol": p.symbol, "Signal": p.signal,
             "Option": p.contract.trading_symbol,
             "Entry LTP": round(p.entry_ltp, 2),
             "Current LTP": round(p.contract.ltp, 2) if p.contract.ltp else "",
             "Effective Stop": round(p.effective_stop, 2),
-            "Target 1": round(p.targets[0], 2), "T1 Hit": "YES" if p.target_hit[0] else "",
-            "Target 2": round(p.targets[1], 2), "T2 Hit": "YES" if p.target_hit[1] else "",
-            "Target 3": round(p.targets[2], 2), "T3 Hit": "YES" if p.target_hit[2] else "",
+        }
+        # Target 1..N / TN Hit -- N = len(config.TARGET_MULTS), 10 as of
+        # 12-Sep-26 (was a hardcoded 3). See config.TARGET_MULTS's own
+        # comment for the "let it continue past T3" rework this reflects.
+        for i, (target, hit) in enumerate(zip(p.targets, p.target_hit), start=1):
+            row[f"Target {i}"] = round(target, 2)
+            row[f"T{i} Hit"] = "YES" if hit else ""
+        row.update({
             "Remaining Qty": p.remaining_qty,
             "Unrealised P/L (Rs)": (round((p.contract.ltp - p.entry_ltp) * p.remaining_qty, 2)
                                     if p.contract.ltp else ""),
             "Realised P/L (Rs)": round(p.realised_pnl, 2),
             "Last Update": ist_clock.now_ist().strftime("%H:%M:%S"),
         })
+        rows.append(row)
 
     path = paths.LIVE_STATUS_FILE
     tmp = path.with_suffix(".tmp")
@@ -595,6 +841,12 @@ def _caps_block(entry_at: datetime, symbol: str, positions: list,
     the moment it is PROMOTED rather than at its original signal time --
     a promotion happens two bars later, by which point the book may have
     filled up. Skipping this would let promotions quietly exceed the caps.
+
+    `open_symbols` is accepted only for call-site compatibility -- as of
+    12-Sep-26 the ONE_POSITION_PER_SYMBOL gate below no longer reads it
+    (see that check's own comment for why: the set was never cleared on
+    close, so it was a strictly-worse duplicate of `positions`, which
+    already carries everything needed and stays accurate).
     """
     realised_so_far = sum(
         p.realised_pnl for p in positions
@@ -603,8 +855,28 @@ def _caps_block(entry_at: datetime, symbol: str, positions: list,
         return (f"daily loss limit hit: Rs {realised_so_far:,.0f} against a "
                 f"cap of Rs {-config.DAILY_MAX_LOSS_RS:,.0f}")
 
-    if config.ONE_POSITION_PER_SYMBOL and symbol in open_symbols:
-        return f"{symbol}: position already open in this symbol"
+    if config.ONE_POSITION_PER_SYMBOL:
+        # BUG FOUND 12-Sep-26 (BLUESTARCO): `open_symbols` is a monotonic
+        # set -- every call site only ever ADDS a symbol to it, nothing
+        # ever removes one, including when that symbol's position fully
+        # closes. So the very first trade a symbol ever took, however it
+        # ended, permanently blocked every later signal for that symbol
+        # for the rest of the day: BLUESTARCO entered BUY PE at 09:25,
+        # exited at 10:00 on "Harish Dot Reversal", and its follow-up BUY
+        # CE at 10:05 was rejected "position already open in this symbol"
+        # even though nothing was actually open any more. config.py's own
+        # comment on ONE_POSITION_PER_SYMBOL is "Never two open positions
+        # in the same underlying" -- concurrently open, not ever-traded.
+        # Fixed the same way the concurrent-position-cap check just below
+        # already does it (see its 06-Aug-26 ICICIPRULI comment): look at
+        # whether a position for this symbol is actually still open as of
+        # entry_at, not at a set that never forgets.
+        still_open = any(
+            p.symbol == symbol and p.entry_time <= entry_at
+            and (not p.closed or (p.exit_time and p.exit_time > entry_at))
+            for p in positions)
+        if still_open:
+            return f"{symbol}: position already open in this symbol"
     if (config.MAX_ENTRIES_PER_DAY is not None
             and entries_taken >= config.MAX_ENTRIES_PER_DAY):
         return f"daily entry cap reached ({config.MAX_ENTRIES_PER_DAY})"
@@ -744,6 +1016,29 @@ def _is_oi_reason(reason: str) -> bool:
     return "-side OI is only" in reason
 
 
+def _shadow_blocked_note(sheet: str, reasons: list[str]) -> str:
+    """
+    Why a shadow re-simulation produced no row (02-Sep-26, Harish: "if we
+    have insufficient balance then the order should be placed in Capital
+    Shadow ... but I do not see the order being placed").
+
+    The gates do not all run on the first attempt. Sizing comes BEFORE
+    audit_option, the OI-buildup gate, the fill and the late OI re-check --
+    so a run that dies at "Insufficient balance" was never asked any of
+    those questions. Re-running it with capital ignored asks them for the
+    first time, and it can fail there instead. That answer used to be
+    thrown away (the reasons list was assigned to `_r`), so the run
+    vanished: rejected for capital, absent from Capital Shadow, with
+    nothing on any sheet saying why.
+
+    It now becomes one extra Rejected row, so every qualified signal is
+    accounted for on some sheet. Changes no trading decision -- the trade
+    was already refused; this only says what happened next.
+    """
+    why = "; ".join(reasons) if reasons else "no reason reported"
+    return f"{sheet} not simulated -- re-run without that gate then failed: {why}"
+
+
 def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
                  candles: dict[str, pd.DataFrame], scrip: pd.DataFrame,
                  angel, trade_date: date, mode: str,
@@ -831,8 +1126,21 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
     eligible = []
     rsi_checkpoint_candidates: list[tuple[SignalRun, datetime]] = []
     candle_momentum_candidates: list[tuple[SignalRun, datetime]] = []
+    candle_blocked = 0
     for run in runs:
         at = _entry_datetime(run, trade_date)
+
+        # FIRST GATE (02-Sep-26, Harish): the run's 2nd candle must have
+        # closed in the signal's own direction -- Bullish for BUY CE,
+        # Bearish for BUY PE -- or it never reaches the Orders sheet. Runs
+        # ahead of every market-condition gate and the whole audit, so a
+        # contradicted signal is out before it spends an option-quote call.
+        ok, note = order_sheet.candle_confirms(final_df, run)
+        if not ok:
+            candle_blocked += 1
+            rejections.append(make_rejection(run.symbol, run.entry_slot,
+                                             run.signal, note, at))
+            continue
 
         ok, note = signal_quality.vix_ok(vix_candles, at)
         if not ok:
@@ -869,6 +1177,10 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
             continue
 
         eligible.append(run)
+
+    if candle_blocked:
+        print(f"[orders] {candle_blocked} signal(s) blocked before the audit "
+              f"-- 2nd candle closed against the signal")
 
     filtered_out = len(runs) - len(eligible)
     if filtered_out:
@@ -1175,6 +1487,12 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
 
             # Worst-first within the bar: low before high, so a bar spanning
             # both stop and target resolves as the stop.
+            # Early-candle stop tighten (12-Sep-26) -- no-op after its first
+            # call for this position (pos.first_candle_checked). Runs
+            # before the stop/target range below so a tightened stop can
+            # take effect within THIS SAME bar if it's already breached.
+            _tighten_stop_after_adverse_first_candle(pos, candles, symbol, ts)
+
             order_sheet.update_position(pos, lo, now, square_off, bar_open=o)
             if pos.closed:
                 break
@@ -1182,15 +1500,21 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
             if pos.closed:
                 break
 
-            # Signal-invalidation exit (20-Aug-26) -- checked AFTER the real
-            # stop/target range for this bar (a genuine SL/Target hit still
-            # wins), only using the bar's close, because colour and MACD
-            # Recomm are only honestly knowable once the candle has closed.
-            # See _macd_invalidated's docstring for the ASIANPAINT case this
-            # is built from.
-            if _macd_invalidated(final_df, candles, symbol, signal, ts):
-                order_sheet.close_for_signal_invalidation(
-                    pos, cl, now, "MACD Invalidation")
+            # Signal-invalidation exit (20-Aug-26 MACD, 12-Sep-26 Harish) --
+            # checked AFTER the real stop/target range for this bar (a
+            # genuine SL/Target hit still wins), only using the bar's
+            # close, because colour/MACD Recomm/Harish Recomm are only
+            # honestly knowable once the candle has closed. See
+            # _macd_invalidated's/_harish_invalidated's docstrings, and
+            # _signal_invalidation_reason's for why this scans every
+            # underlying slot since the last check (15-Sep-26 AUBANK fix)
+            # instead of only this option bar's own timestamp.
+            reason = _signal_invalidation_reason(
+                final_df, candles, symbol, signal,
+                pos.last_invalidation_ts or pos.entry_time, ts)
+            pos.last_invalidation_ts = ts
+            if reason:
+                order_sheet.close_for_signal_invalidation(pos, cl, now, reason)
                 if pos.closed:
                     break
 
@@ -1222,7 +1546,9 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
             # "what would this have done" is a meaningful question -- capital
             # and data would have been fine, the book just had no room.
             if blocked.startswith("concurrent position cap reached"):
-                shadow_pos, _shadow_reasons, ltp_2c = _try_build_position(run, entry_at)
+                shadow_pos, shadow_why, ltp_2c = _try_build_position(run, entry_at)
+                if shadow_pos is None:
+                    reject(_shadow_blocked_note("Missed_Concurrent", shadow_why))
                 if shadow_pos is not None:
                     # PROMOTION (07-Aug-26, Harish: "wait for next 2 candles
                     # and see the performance... if trending up, move it to
@@ -1264,13 +1590,18 @@ def process_date(final_df: pd.DataFrame, ref_df: pd.DataFrame,
             # only when the failure is PURELY that one thing, see the
             # classification helpers' own comment above.
             if reasons and all(_is_capital_reason(r) for r in reasons):
-                cap_pos, _r, _l = _try_build_position(run, entry_at, ignore_capital=True)
+                cap_pos, cap_why, _l = _try_build_position(run, entry_at,
+                                                           ignore_capital=True)
                 if cap_pos is not None:
                     capital_shadow_positions.append(cap_pos)
+                else:
+                    reject(_shadow_blocked_note("Capital Shadow", cap_why))
             elif reasons and all(_is_oi_reason(r) for r in reasons):
-                oi_pos, _r, _l = _try_build_position(run, entry_at, ignore_oi=True)
+                oi_pos, oi_why, _l = _try_build_position(run, entry_at, ignore_oi=True)
                 if oi_pos is not None:
                     oi_shadow_positions.append(oi_pos)
+                else:
+                    reject(_shadow_blocked_note("OI Blocked", oi_why))
             continue
 
         positions.append(pos)
@@ -1640,8 +1971,14 @@ def rehydrate_live_state(state: dict, workbook, trade_date: date) -> None:
             # stop) -- overwrite with what was ACTUALLY quoted/resting at
             # entry, never the recompute.
             pos.stop_loss = float(_cell(row, "Stop Loss LTP"))
-            pos.targets = tuple(float(_cell(row, f"Target {i} LTP")) for i in (1, 2, 3))
-            pos.target_hit = [_cell(row, f"T{i} Hit") == "YES" for i in (1, 2, 3)]
+            # Reads back however many target levels config.TARGET_MULTS
+            # actually defines (10 as of 12-Sep-26, was a hardcoded (1,2,3))
+            # -- see order_sheet.TARGET_LTP_COLUMNS/TARGET_HIT_COLUMNS.
+            _n_targets = len(config.TARGET_MULTS)
+            pos.targets = tuple(float(_cell(row, f"Target {i} LTP"))
+                                for i in range(1, _n_targets + 1))
+            pos.target_hit = [_cell(row, f"T{i} Hit") == "YES"
+                              for i in range(1, _n_targets + 1)]
             pos.remaining_qty = int(_cell(row, "Remaining Qty") or pos.quantity)
             pos.peak_ltp = float(_cell(row, "Max LTP") or pos.entry_ltp)
             pos.trough_ltp = float(_cell(row, "Min LTP") or pos.entry_ltp)
@@ -1728,9 +2065,18 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
     only ever force-closed at square-off if `ist_clock.now_ist()` has
     genuinely reached 15:15 -- never because the data ran out early.
     """
+    import file_mgmt
     import signal_quality
 
     now = ist_clock.now_ist()
+
+    # Symbols allowed to spend real money (02-Sep-26). The merged
+    # 01_SourceFile.xlsx carries every symbol; its 'Live' Yes/No column says
+    # which ones are cleared to trade. With LIVE_RESTRICT_TO_LIVE_ROWS on,
+    # ref_df is already only those rows and this set changes nothing -- it
+    # is the second, independent guard for the day that flag gets turned
+    # off. See _open_position below, and config.LIVE_ORDERS_ONLY_FOR_LIVE_ROWS.
+    live_ok_symbols = file_mgmt.live_symbols(ref_df)
 
     if not state["nfo_fetched"]:
         state["nfo_fetched"] = True
@@ -1764,6 +2110,16 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
         if now < fill_candle_closes:
             continue
         state["seen"].add((run.symbol, run.entry_slot))
+
+        # FIRST GATE -- same rule and same reasoning as process_date's, see
+        # order_sheet.candle_confirms. The 2nd bar of the run must have
+        # closed in the signal's direction before anything else is asked.
+        ok, note = order_sheet.candle_confirms(final_df, run)
+        if not ok:
+            print(f"[live-orders] {note}")
+            state["rejections"].append(make_rejection(
+                run.symbol, run.entry_slot, run.signal, note, at))
+            continue
 
         ok, note = signal_quality.vix_ok(vix_candles, at)
         if not ok:
@@ -1851,9 +2207,23 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
             return (f"daily loss limit hit: Rs {realised_so_far:,.0f} "
                     f"against a cap of Rs {-config.DAILY_MAX_LOSS_RS:,.0f} "
                     f"-- no new entries")
-        if config.ONE_POSITION_PER_SYMBOL and symbol in state["open_symbols"]:
-            return (f"{symbol}: position already open in this symbol -- "
-                    f"skipping new entry until it closes")
+        if config.ONE_POSITION_PER_SYMBOL:
+            # BUG FOUND 12-Sep-26 (BLUESTARCO), same root cause as
+            # process_date's _caps_block: state["open_symbols"] is only
+            # ever added to (see the four state["open_symbols"].add(...)
+            # call sites), never removed from when a run/live position
+            # actually resolves -- so once a symbol traded once, it was
+            # locked out of every later entry for the rest of the day.
+            # state["open_runs"] and state["live_positions"] ARE correctly
+            # maintained (entries deleted on resolution -- see
+            # _advance_open_runs/_advance_live_positions), so check those
+            # directly instead of the stale set.
+            still_open = (
+                any(sym == symbol for sym, _slot in state["open_runs"])
+                or any(sym == symbol for sym, _slot in state["live_positions"]))
+            if still_open:
+                return (f"{symbol}: position already open in this symbol -- "
+                        f"skipping new entry until it closes")
         if (config.MAX_ENTRIES_PER_DAY is not None
                 and state["entries_taken"] >= config.MAX_ENTRIES_PER_DAY):
             return f"daily entry cap reached ({config.MAX_ENTRIES_PER_DAY})"
@@ -2091,6 +2461,23 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
             return True
 
         entry_slot = key[1]
+
+        # WATCHLIST GATE (02-Sep-26). Only a symbol marked Live=Yes in the
+        # merged source ever gets a real order. Checked HERE, at the single
+        # point where every entry path converges, rather than at each of
+        # the four call sites -- there is no route to enter_live() that
+        # bypasses this.
+        if (config.LIVE_ORDERS_ONLY_FOR_LIVE_ROWS
+                and symbol.strip().upper() not in live_ok_symbols):
+            state["rejections"].append(make_rejection(
+                symbol, entry_slot, signal,
+                f"{symbol}: not marked {config.COL_LIVE}=Yes in "
+                f"{paths.SOURCE_FILE.name} -- no real order placed",
+                ist_clock.now_ist()))
+            print(f"[live-orders] {symbol}: {config.COL_LIVE} is not Yes -- "
+                  f"skipping live entry{label}")
+            return False
+
         if live_orders.kill_switch_active():
             state["rejections"].append(make_rejection(
                 symbol, entry_slot, signal,
@@ -2164,11 +2551,13 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
             # ever trends up) happens later, once 2 candles have actually
             # closed -- see _check_promotions below.
             if blocked.startswith("concurrent position cap reached"):
-                snap, opt_type, _reasons = _try_build_snapshot(run, entry_at)
+                snap, opt_type, shadow_why = _try_build_snapshot(run, entry_at)
                 if snap is not None:
                     state["shadow_open_runs"][(symbol, run.entry_slot)] = {
                         "snapshot": snap, "opt_type": opt_type,
                     }
+                else:
+                    reject(_shadow_blocked_note("Missed_Concurrent", shadow_why))
             continue
 
         snap, opt_type, reasons = _try_build_snapshot(run, entry_at)
@@ -2179,19 +2568,23 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
             # one reason" rule as process_date, see _is_capital_reason/
             # _is_oi_reason's own comment.
             if reasons and all(_is_capital_reason(r) for r in reasons):
-                cap_snap, cap_opt_type, _r = _try_build_snapshot(
+                cap_snap, cap_opt_type, cap_why = _try_build_snapshot(
                     run, entry_at, ignore_capital=True)
                 if cap_snap is not None:
                     state["capital_shadow_open_runs"][(symbol, run.entry_slot)] = {
                         "snapshot": cap_snap, "opt_type": cap_opt_type,
                     }
+                else:
+                    reject(_shadow_blocked_note("Capital Shadow", cap_why))
             elif reasons and all(_is_oi_reason(r) for r in reasons):
-                oi_snap, oi_opt_type, _r = _try_build_snapshot(
+                oi_snap, oi_opt_type, oi_why = _try_build_snapshot(
                     run, entry_at, ignore_oi=True)
                 if oi_snap is not None:
                     state["oi_shadow_open_runs"][(symbol, run.entry_slot)] = {
                         "snapshot": oi_snap, "opt_type": oi_opt_type,
                     }
+                else:
+                    reject(_shadow_blocked_note("OI Blocked", oi_why))
             continue
 
         _open_position((symbol, run.entry_slot), symbol, signal, snap,
@@ -2360,6 +2753,12 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
                     if o > 0 and (o - lo) / o > config.MAX_INTRABAR_COLLAPSE:
                         lo = min(o, cl)
                     order_sheet.note_bar_range(pos, hi, lo)
+
+                    # Early-candle stop tighten (12-Sep-26) -- see
+                    # _tighten_stop_after_adverse_first_candle's docstring.
+                    _tighten_stop_after_adverse_first_candle(
+                        pos, candles, pos.symbol, ts)
+
                     order_sheet.update_position(pos, lo, bar_now, square_off, bar_open=o)
                     if pos.closed:
                         break
@@ -2367,14 +2766,22 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
                     if pos.closed:
                         break
 
-                    # Signal-invalidation exit (20-Aug-26) -- see
-                    # _macd_invalidated's docstring. Same placement as the
-                    # BACKTEST walk in _try_build_position: after the real
-                    # stop/target range for this bar, using the bar's close.
-                    if _macd_invalidated(final_df, candles, pos.symbol,
-                                         pos.signal, ts):
+                    # Signal-invalidation exit (20-Aug-26 MACD, 12-Sep-26
+                    # Harish) -- see _macd_invalidated's/_harish_invalidated's
+                    # docstrings. Same placement as the BACKTEST walk in
+                    # _try_build_position: after the real stop/target range
+                    # for this bar, using the bar's close. Scans every
+                    # underlying slot since the last check, not just this
+                    # option bar's own timestamp -- see
+                    # _signal_invalidation_reason's docstring (15-Sep-26
+                    # AUBANK fix).
+                    reason = _signal_invalidation_reason(
+                        final_df, candles, pos.symbol, pos.signal,
+                        pos.last_invalidation_ts or pos.entry_time, ts)
+                    pos.last_invalidation_ts = ts
+                    if reason:
                         order_sheet.close_for_signal_invalidation(
-                            pos, cl, bar_now, "MACD Invalidation")
+                            pos, cl, bar_now, reason)
                         if pos.closed:
                             break
 
@@ -2445,17 +2852,33 @@ def advance_live_day(state: dict, final_df: pd.DataFrame, ref_df: pd.DataFrame,
                 if _check_broker_stop_fired(angel, pos, bar_now):
                     break
 
-                # --- signal invalidation (20-Aug-26) -- candle-close only,
-                # needs THIS bar's colour and its MACD Recomm slot, neither
-                # of which exists between candle closes (see the fast
-                # tracker's docstring for why it can't run this check).
-                if _macd_invalidated(final_df, candles, pos.symbol,
-                                     pos.signal, ts):
+                # Early-candle stop tighten (12-Sep-26) -- see
+                # _tighten_stop_after_adverse_first_candle's docstring. `pos`
+                # is mutated in place across cycles here (never rebuilt
+                # from a snapshot, unlike the PAPER replay above), so
+                # pos.first_candle_checked correctly guards this to one
+                # real tightening for the life of the position.
+                _tighten_stop_after_adverse_first_candle(
+                    pos, candles, pos.symbol, ts)
+
+                # --- signal invalidation (20-Aug-26 MACD, 12-Sep-26 Harish)
+                # -- candle-close only, needs THIS bar's colour/MACD
+                # Recomm/Harish Recomm/Dot slot, none of which exists
+                # between candle closes (see the fast tracker's docstring
+                # for why it can't run this check). Scans every underlying
+                # slot since the last check, not just this option bar's own
+                # timestamp -- see _signal_invalidation_reason's docstring
+                # (15-Sep-26 AUBANK fix).
+                reason = _signal_invalidation_reason(
+                    final_df, candles, pos.symbol, pos.signal,
+                    pos.last_invalidation_ts or pos.entry_time, ts)
+                pos.last_invalidation_ts = ts
+                if reason:
                     try:
                         _real_exit(angel, pos, pos.remaining_qty,
-                                  "MACD Invalidation", bar_now, True)
+                                  reason, bar_now, True)
                     except live_orders.LiveOrderError as exc:
-                        print(f"[live-orders] {pos.symbol}: MACD-INVALIDATION "
+                        print(f"[live-orders] {pos.symbol}: {reason.upper()} "
                               f"EXIT FAILED -- {exc}")
                     break
 

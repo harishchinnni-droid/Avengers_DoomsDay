@@ -16,6 +16,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 import config
+import order_sheet
 
 # BUY CE green, BUY PE red, WAIT grey. Deliberately not red/green for
 # profit/loss elsewhere -- these mark direction, not outcome.
@@ -25,6 +26,15 @@ FILL_PE = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid
 FONT_PE = Font(color="9C0006", bold=True)
 FILL_WAIT = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
 FONT_WAIT = Font(color="808080")
+# INVALID (2nd candle contradicted the signal) is amber, not red -- red
+# already means BUY PE on these sheets and re-using it would read as a
+# direction, not a rejection.
+FILL_INVALID = PatternFill(start_color="FFE699", end_color="FFE699", fill_type="solid")
+FONT_INVALID = Font(color="9C6500", bold=True)
+# Candle row: coloured font only, no fill -- it's a fact row, not a decision
+# row, and should not shout as loudly as Final/Confirmed Recomm.
+FONT_BULL = Font(color="006100")
+FONT_BEAR = Font(color="9C0006")
 
 FILL_HEADER = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
 FONT_HEADER = Font(bold=True)
@@ -72,7 +82,11 @@ def freeze_matrix_panes(ws) -> None:
 
 def highlight_final_recomm(ws, metrics_col: int = 2) -> int:
     """
-    Colour the Final Recomm rows: green BUY CE, red BUY PE, grey WAIT.
+    Colour the decision rows of the Final sheet.
+
+    Final Recomm / Confirmed Recomm: green BUY CE, red BUY PE, grey WAIT,
+    amber INVALID. Candle: green/red font only (Bullish/Bearish) -- a fact
+    row, kept quieter than the decision rows.
 
     Direct cell styling rather than a conditional-formatting rule, because
     the rule would have to cover the whole sheet and would then also colour
@@ -81,17 +95,25 @@ def highlight_final_recomm(ws, metrics_col: int = 2) -> int:
     touched = 0
     for row in ws.iter_rows(min_row=2):
         label = row[metrics_col - 1].value
-        if label != "Final Recomm":
+        if label not in ("Final Recomm", "Confirmed Recomm", "Candle"):
             continue
         touched += 1
         for cell in row[metrics_col:]:
             value = str(cell.value).strip() if cell.value is not None else ""
+            if label == "Candle":
+                if value == getattr(config, "CANDLE_BULLISH", "Bullish"):
+                    cell.font = FONT_BULL
+                elif value == getattr(config, "CANDLE_BEARISH", "Bearish"):
+                    cell.font = FONT_BEAR
+                continue
             if value == config.SIGNAL_BUY_CE:
                 cell.fill, cell.font = FILL_CE, FONT_CE
             elif value == config.SIGNAL_BUY_PE:
                 cell.fill, cell.font = FILL_PE, FONT_PE
             elif value == config.SIGNAL_WAIT:
                 cell.fill, cell.font = FILL_WAIT, FONT_WAIT
+            elif value == getattr(config, "SIGNAL_INVALID", "INVALID"):
+                cell.fill, cell.font = FILL_INVALID, FONT_INVALID
     return touched
 
 
@@ -206,13 +228,16 @@ ORDERS_HEADER_GROUPS: dict[str, str] = {
     "Entry Lag (min)": "decision", "Lookahead Check": "decision",
 
     "Entry LTP": "sizing", "Stop Loss LTP": "sizing",
-    "Target 1 LTP": "sizing", "Target 2 LTP": "sizing", "Target 3 LTP": "sizing",
+    # Target 1..N LTP -- N = len(config.TARGET_MULTS), 10 as of 12-Sep-26
+    # (was a hardcoded 3). Built from order_sheet.TARGET_LTP_COLUMNS so this
+    # never drifts out of sync with the actual target ladder again.
+    **{col: "sizing" for col in order_sheet.TARGET_LTP_COLUMNS},
     "Risk/Unit (Rs)": "sizing", "Quantity (Lots)": "sizing",
     "Quantity (Units)": "sizing", "Risk Amount (Rs)": "sizing",
     "Capital Required (Rs)": "sizing",
 
     "Current LTP": "tracking", "Max LTP": "tracking", "Min LTP": "tracking",
-    "T1 Hit": "tracking", "T2 Hit": "tracking", "T3 Hit": "tracking",
+    **{col: "tracking" for col in order_sheet.TARGET_HIT_COLUMNS},
     "Breakeven Active": "tracking", "TSL Breach Streak": "tracking",
     "Effective Stop": "tracking",
 

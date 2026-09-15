@@ -82,7 +82,8 @@ def _fetch_instruments(kite, exchange: str) -> pd.DataFrame:
     return df
 
 
-def update_instrument_tokens(workbook: Path, kite, trade_date: date) -> pd.DataFrame:
+def update_instrument_tokens(workbook: Path, kite, trade_date: date,
+                             mode: str | None = None) -> pd.DataFrame:
     """
     Resolve every watchlist symbol's NSE equity instrument_token and write
     the Zerodha_Token column back onto the watchlist sheet.
@@ -92,10 +93,16 @@ def update_instrument_tokens(workbook: Path, kite, trade_date: date) -> pd.DataF
     data_ingestion uses to pull the underlying's own 5-min candles for the
     matrix sheets. Option contract tokens are resolved later, per-trade, in
     option_chain.py.
+
+    mode (02-Sep-26): passed straight to file_mgmt.read_reference_sheet, so
+    a LIVE run resolves and writes back only the Live=Yes subset of the
+    merged source. The DATED workbook's Reference sheet is then the list
+    this session actually watched -- which is what you want when reading
+    back what happened -- while 01_SourceFile.xlsx itself keeps every row.
     """
     import file_mgmt
 
-    df_ref = file_mgmt.read_reference_sheet(workbook)
+    df_ref = file_mgmt.read_reference_sheet(workbook, mode=mode)
 
     nse = _fetch_instruments(kite, "NSE")
     nse = nse[nse["segment"] == "NSE"].copy()

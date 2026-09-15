@@ -11,6 +11,8 @@ way down, so a BACKTEST run can never be mistaken for a LIVE one.
      2  broker_auth.py     Angel One (headless TOTP) + Zerodha (cached/Selenium)
      3  calendar_mgmt.py   LIVE or BACKTEST, validate dates against NSE calendar
      4  file_mgmt.py       copy 01_SourceFile.xlsx -> 'DD-Mon-YY FNO-L-TW-ALL.xlsx'
+                           BACKTEST reads every row; LIVE reads only the
+                           rows marked Live=Yes (config.COL_LIVE)
      5  token_mgmt.py      resolve symbols -> Zerodha instrument tokens
      6  angel_scrip.py     download Angel One scrip master (weekly cache)
      7  data_ingestion.py  5-min candles, cached, no unclosed bars
@@ -26,6 +28,17 @@ way down, so a BACKTEST run can never be mistaken for a LIVE one.
 Steps 9-11 need an Angel One session. Without one the run still produces the
 matrix sheets and says plainly that the order sheets were skipped -- it does
 not write empty Orders/Rejected sheets that look like "no signals today".
+
+WATCHLIST (02-Sep-26): one merged 01_SourceFile.xlsx replaces the old pair
+01_SourceFile_50.xlsx / 01_SourceFile_200.xlsx. Every symbol lives in it;
+the 'Live' Yes/No column decides which ones a LIVE session watches and which
+ones may be sent to the broker for real. Both originals are still on disk,
+unread.
+
+2ND-CANDLE CONFIRMATION (02-Sep-26): a qualified Final Recomm run only
+reaches the Orders sheet if its 2nd candle closed Bullish (BUY CE) or
+Bearish (BUY PE). This is the first gate -- the audit checks start after
+it. config.FINAL_CANDLE_CONFIRM_REQUIRED.
 
 ORDER PLACEMENT (20-Aug-26): a LIVE session (not BACKTEST -- see
 run_live_day/advance_live_day) places REAL orders on Angel One via
@@ -74,7 +87,8 @@ def run_one_date(trade_date: date, mode: str, kite, angel,
 
     # ---- 5. Zerodha tokens ----------------------------------------------
     _banner(5, "Zerodha instrument tokens")
-    df_ref = token_mgmt.update_instrument_tokens(workbook, kite, trade_date)
+    df_ref = token_mgmt.update_instrument_tokens(
+        workbook, kite, trade_date, mode=mode)
 
     # ---- 6. Angel scrip master -------------------------------------------
     _banner(6, "Angel One scrip master")
@@ -275,7 +289,8 @@ def setup_live_day(trade_date: date, kite, angel):
     workbook = file_mgmt.create_trade_file(trade_date, config.LIVE)
 
     _banner(5, "Zerodha instrument tokens")
-    df_ref = token_mgmt.update_instrument_tokens(workbook, kite, trade_date)
+    df_ref = token_mgmt.update_instrument_tokens(
+        workbook, kite, trade_date, mode=config.LIVE)
 
     _banner(6, "Angel One scrip master")
     scrip = None

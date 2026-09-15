@@ -97,7 +97,8 @@ def run_one_date(trade_date: date, mode: str, kite, angel,
 
     # ---- 5. Zerodha tokens ----------------------------------------------
     _banner(5, "Zerodha instrument tokens")
-    df_ref = token_mgmt.update_instrument_tokens(workbook, kite, trade_date)
+    df_ref = token_mgmt.update_instrument_tokens(
+        workbook, kite, trade_date, mode=mode)
 
     # ---- 6. Angel scrip master -------------------------------------------
     _banner(6, "Angel One scrip master")
@@ -268,7 +269,8 @@ def setup_live_day(trade_date: date, kite, angel):
         trade_date, config.LIVE, path_fn=paths.dated_workbook_path_ema_pivot)
 
     _banner(5, "Zerodha instrument tokens")
-    df_ref = token_mgmt.update_instrument_tokens(workbook, kite, trade_date)
+    df_ref = token_mgmt.update_instrument_tokens(
+        workbook, kite, trade_date, mode=config.LIVE)
 
     _banner(6, "Angel One scrip master")
     scrip = None
