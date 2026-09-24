@@ -7,3 +7,6 @@ logs/
 __pycache__/
 *.pyc
 *.pyo
+
+# Local backups made before edits
+*.bak*

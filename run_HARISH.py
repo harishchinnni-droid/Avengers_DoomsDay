@@ -86,6 +86,7 @@ from datetime import date
 
 import bootstrap
 import matrix_sheets_harish
+import gsheet_orders_sync             # 24-Sep-26: Orders -> Google Sheets (LIVE only)
 
 
 def _banner(step, title: str) -> None:
@@ -400,6 +401,9 @@ def run_live_day(trade_date: date, kite, angel) -> None:
                 index_candles=index_candles, vix_candles=vix_candles, kite=kite)
 
             file_mgmt.write_sheet(workbook, "Orders", orders_df)
+            # 24-Sep-26: ADDITIONAL copy to Google Sheets (background, never
+            # blocks or breaks this loop). Excel above is unchanged.
+            gsheet_orders_sync.push(orders_df, trade_date)
             file_mgmt.write_sheet(workbook, "Rejected", rejected_df)
             file_mgmt.write_sheet(workbook, "Missed_Concurrent", missed_df)
             file_mgmt.write_sheet(workbook, "Capital Shadow", capital_shadow_df)
@@ -432,6 +436,7 @@ def run_live_day(trade_date: date, kite, angel) -> None:
     live_loop.run_live_session(
         on_candle, trade_date, on_tick=on_fast_tick,
         tick_every=config.LIVE_FAST_TRACK_INTERVAL_SECS)
+    gsheet_orders_sync.flush()          # let the last Google push finish
     print(f"\n[live] session complete -> {workbook.name}")
 
 
